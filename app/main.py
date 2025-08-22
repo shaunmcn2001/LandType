@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types → GeoTIFF",
     description="Enter a QLD Lot/Plan (e.g. 13DP1246224 or 13SP181800); get Land Types over the parcel boundary as a GeoTIFF for Google Earth.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -48,7 +48,6 @@ def home():
     a.ghost{color:var(--accent);text-decoration:none;border:1px solid #294a86;background:#0d1730}
     .note{margin-top:10px;font-size:13px;color:#89a3d6}
     .out{margin-top:18px;border-top:1px solid #203055;padding-top:14px;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;white-space:pre-wrap}
-    .link{display:inline-block;margin-top:10px}
     .badge{display:inline-block;padding:.2rem .5rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px;margin-left:8px}
   </style>
 </head>
@@ -56,7 +55,7 @@ def home():
   <div class="wrap">
     <div class="card">
       <h1>QLD Land Types → GeoTIFF <span class="badge">EPSG:4326</span></h1>
-      <p>Enter a Queensland <strong>Lot / Plan</strong> like <code>13DP1246224</code> or <code>13SP181800</code>. We’ll fetch the parcel, intersect Land Types, and return a Google‑Earth‑ready GeoTIFF (RGBA, transparent background).</p>
+      <p>Enter a Queensland <strong>Lot / Plan</strong> like <code>13DP1246224</code> or <code>13SP181800</code>. We’ll fetch the parcel, intersect Land Types, and return a Google‑Earth‑ready GeoTIFF (RGBA, transparent background). Legend now includes area per land type (ha).</p>
 
       <label for="lotplan">Lot / Plan</label>
       <input id="lotplan" type="text" placeholder="e.g. 13DP1246224" autocomplete="off" />
@@ -67,8 +66,8 @@ def home():
           <input id="maxpx" type="number" min="256" max="8192" value="4096" />
         </div>
         <div>
-          <label for="mode">Output</label>
-          <div class="row">
+          <label>Output</label>
+          <div class="btns">
             <button class="primary" id="btn-download">Download GeoTIFF</button>
             <a class="ghost" id="btn-json" href="#">View JSON summary</a>
           </div>
@@ -76,7 +75,7 @@ def home():
       </div>
 
       <div class="note">
-        Tips: Use uppercase Lot/Plan (we’ll normalise). Try <code>13SP181800</code> if you want a quick test. See <a href="/docs">/docs</a> for API.
+        Tips: Input is normalised to UPPERCASE. Try <code>13SP181800</code> for a quick test. See <a href="/docs">/docs</a> for API.
       </div>
 
       <div id="out" class="out"></div>
@@ -102,9 +101,8 @@ def home():
       e.preventDefault();
       const lot = normLot($lot.value);
       if(!lot){ $out.textContent = 'Enter a Lot/Plan first.'; return; }
-      // Navigate to trigger a file download
       window.location.href = mkUrl(true);
-      $out.textContent = 'Generating GeoTIFF… If a download doesn’t start, check the service logs or try View JSON summary.';
+      $out.textContent = 'Generating GeoTIFF… If a download doesn’t start, check logs or try JSON first.';
     });
 
     $btnJs.addEventListener('click', async (e) => {
@@ -114,30 +112,27 @@ def home():
       $out.textContent = 'Requesting JSON summary…';
       try{
         const res = await fetch(mkUrl(false));
-        if(!res.ok){
-          const txt = await res.text();
+        const txt = await res.text();
+        try {
+          const data = JSON.parse(txt);
+          $out.textContent = JSON.stringify(data, null, 2);
+        } catch {
           $out.textContent = `Error ${res.status}: ${txt}`;
-          return;
         }
-        const data = await res.json();
-        $out.textContent = JSON.stringify(data, null, 2);
       }catch(err){
         $out.textContent = 'Network error: ' + err;
       }
     });
 
-    // Convenience: focus input on load
     setTimeout(()=>{ $lot.focus(); }, 50);
   </script>
 </body>
 </html>"""
 
-# ---------- API: Health ----------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ---------- API: Export ----------
 @app.get("/export")
 def export_geotiff(
     lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13DP1246224 or 13SP181800"),
@@ -145,7 +140,6 @@ def export_geotiff(
     download: bool = Query(True, description="Return file download (True) or JSON summary (False)"),
 ):
     try:
-        # Normalise lotplan to uppercase and strip spaces
         lotplan = lotplan.strip().upper()
 
         parcel_fc = fetch_parcel_geojson(lotplan)
