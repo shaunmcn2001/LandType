@@ -1,4 +1,5 @@
 from typing import Dict, Tuple, List
+import re
 import numpy as np
 import rasterio
 from rasterio.transform import from_bounds
@@ -28,10 +29,6 @@ def _reproject_geom_generic(geom, src_epsg: int, dst_epsg: int):
     return shp_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
 
 def reproject_geom(geom, src_epsg: int, dst_epsg: int):
-    """
-    Explicit coordinate-list reprojection for Polygons/MultiPolygons
-    to avoid any topology surprises; fallback to generic transform otherwise.
-    """
     geom = force_2d(geom)
     gmap = mapping(geom)
     if gmap["type"] == "Polygon":
@@ -52,20 +49,29 @@ def reproject_geom(geom, src_epsg: int, dst_epsg: int):
     else:
         return _reproject_geom_generic(geom, src_epsg, dst_epsg)
 
-def _pick(props: Dict, *keys: str, default=None):
-    """Return the first present (and truthy) property among keys."""
+def _pick(props_uc: Dict[str, object], *keys: str, default=None):
+    """Return the first present (and truthy) property among keys, using upper-cased keys."""
     for k in keys:
-        v = props.get(k)
+        v = props_uc.get(k)
         if v not in (None, ""):
             return v
     return default
 
+def _pick_regex(props_uc: Dict[str, object], patterns: List[str], default=None):
+    """Fallback: search for first key matching any regex pattern (case-insensitive)."""
+    for pat in patterns:
+        rx = re.compile(pat, flags=re.IGNORECASE)
+        for key_uc, val in props_uc.items():
+            if rx.search(key_uc):
+                if val not in (None, ""):
+                    return val
+    return default
+
 def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
     """
-    Returns a list of tuples:
-      (geom_4326, code, name, area_ha)
+    Returns a list of tuples: (geom_4326, code, name, area_ha)
     - Intersection computed in EPSG:3857 (for correct area), then reprojected to EPSG:4326.
-    - Attribute lookup is case-insensitive (handles lt_code_1 vs LT_CODE_1).
+    - Attribute lookup is case-insensitive and includes regex fallback for unknown field names.
     """
     parcel = to_shapely_union(parcel_fc_3857)
     if parcel.is_empty:
@@ -75,19 +81,26 @@ def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
 
     for feat in landtypes_fc_3857["features"]:
         props_raw = (feat.get("properties", {}) or {})
-        # <<< key normalization: make a UPPER-CASE copy so lookups are case-insensitive
-        props = { (k.upper() if isinstance(k, str) else k): v for k, v in props_raw.items() }
+        # Case-insensitive view of properties
+        props_uc = { (k.upper() if isinstance(k, str) else k): v for k, v in props_raw.items() }
 
-        def pick(*keys: str, default=None):
-            for k in keys:
-                v = props.get(k)
-                if v not in (None, ""):
-                    return v
-            return default
+        # Try common names first, then regex fallback
+        code = _pick(props_uc, "LT_CODE_1", "LT_CODE", "LANDTYPE_CODE", "LTYPE_CODE")
+        if code in (None, ""):
+            code = _pick_regex(
+                props_uc,
+                patterns=[r"\bLT[_ ]?CODE\b", r"\bLAND[-_ ]?TYPE[-_ ]?CODE\b", r"\bCODE\b"]
+            )
+        name = _pick(props_uc, "LT_NAME_1", "LT_NAME", "LANDTYPE_NAME", "LTYPE_NAME")
+        if name in (None, ""):
+            name = _pick_regex(
+                props_uc,
+                patterns=[r"\bLT[_ ]?NAME\b", r"\bLAND[-_ ]?TYPE[-_ ]?NAME\b", r"\bNAME\b", r"\bDESC(RIPTION)?\b"]
+            )
 
-        # Land Types commonly expose LT_CODE_1 / LT_NAME_1, but sometimes lower-case or alt names
-        code = pick("LT_CODE_1", "LT_CODE", "LANDTYPE_CODE", "LTYPE_CODE", default="UNK")
-        name = pick("LT_NAME_1", "LT_NAME", "LANDTYPE_NAME", "LTYPE_NAME", default="Unknown")
+        # Final defaults if still missing
+        code = str(code) if code not in (None, "") else "UNK"
+        name = str(name) if name not in (None, "") else "Unknown"
 
         g = force_2d(shape(feat["geometry"]))
         if not g.is_valid or g.is_empty:
@@ -104,7 +117,7 @@ def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
         if inter4326 is None or inter4326.is_empty:
             continue
 
-        results.append((inter4326, str(code), str(name), area_ha))
+        results.append((inter4326, code, name, area_ha))
 
     return results
 
@@ -122,16 +135,9 @@ def choose_raster_size(bounds4326: Tuple[float, float, float, float], max_px: in
     return width, height
 
 def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
-    """
-    Rasterize clipped land type polygons to an RGBA GeoTIFF in EPSG:4326.
-    Transparent background with per-code deterministic color.
-    Returns summary dict {legend, bounds, path, width, height}.
-    Legend is de-duplicated by code and includes summed area_ha.
-    """
     if not shapes_clipped_4326:
         raise ValueError("No intersecting land type polygons found for this parcel.")
 
-    # Overall bounds in 4326
     union = unary_union([g for (g, _code, _name, _ha) in shapes_clipped_4326])
     west, south, east, north = union.bounds
     width, height = choose_raster_size((west, south, east, north), max_px=max_px)
@@ -144,7 +150,6 @@ def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
             codes_order.append(code)
     code_to_id = {c: i + 1 for i, c in enumerate(codes_order)}  # 0 = background
 
-    # Rasterize to class ids
     shapes = [(mapping(g), code_to_id[c]) for (g, c, _n, _ha) in shapes_clipped_4326]
     class_raster = rasterize(
         shapes=shapes,
@@ -200,7 +205,6 @@ def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
             }
         legend_map[code]["area_ha"] += float(area_ha)
 
-    # Stable order: by descending area, then code
     legend = sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"]))
 
     return {
