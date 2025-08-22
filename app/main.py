@@ -76,6 +76,7 @@ def home():
           <div class="btns">
             <button class="primary" id="btn-download">Download GeoTIFF</button>
             <a class="ghost" id="btn-json" href="#">View JSON summary</a>
+            <a class="ghost" id="btn-kmz" href="#">Download KMZ (clickable)</a>
           </div>
         </div>
       </div>
@@ -129,7 +130,18 @@ def home():
         $out.textContent = 'Network error: ' + err;
       }
     });
-
+  const $btnKMZ = document.getElementById('btn-kmz');
+  function mkKmzUrl(){
+    const lotplan = encodeURIComponent(normLot($lot.value));
+    return `/export_kmz?lotplan=${lotplan}`;
+  }
+  $btnKMZ.addEventListener('click', (e) => {
+    e.preventDefault();
+    const lot = normLot($lot.value);
+    if(!lot){ $out.textContent = 'Enter a Lot/Plan first.'; return; }
+    window.location.href = mkKmzUrl();
+    $out.textContent = 'Generating KMZ…';
+  });
     setTimeout(()=>{ $lot.focus(); }, 50);
   </script>
 </body>
