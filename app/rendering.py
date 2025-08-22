@@ -1,9 +1,9 @@
-from typing import List, Dict, Tuple
+from typing import Dict, Tuple, List
 import numpy as np
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.features import rasterize
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape, mapping, Polygon, MultiPolygon
 from shapely.ops import unary_union
 from shapely import force_2d
 from pyproj import Transformer
@@ -22,46 +22,83 @@ def bbox_3857(geom) -> Tuple[float, float, float, float]:
     minx, miny, maxx, maxy = geom.bounds
     return (minx, miny, maxx, maxy)
 
-def reproject_geom(geom, src_epsg: int, dst_epsg: int):
+def _reproject_geom_generic(geom, src_epsg: int, dst_epsg: int):
     transformer = Transformer.from_crs(f"EPSG:{src_epsg}", f"EPSG:{dst_epsg}", always_xy=True)
-    def _reproj_coords(coords):
-        for x, y in coords:
-            yield transformer.transform(x, y)
-    geom_m = mapping(geom)
-    if geom_m["type"] == "Polygon":
+    from shapely.ops import transform as shp_transform
+    return shp_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
+
+def reproject_geom(geom, src_epsg: int, dst_epsg: int):
+    """
+    Explicit coordinate-list reprojection for Polygons/MultiPolygons
+    to avoid any topology surprises; fallback to generic transform otherwise.
+    """
+    geom = force_2d(geom)
+    gmap = mapping(geom)
+    if gmap["type"] == "Polygon":
+        transformer = Transformer.from_crs(f"EPSG:{src_epsg}", f"EPSG:{dst_epsg}", always_xy=True)
         rings = []
-        for ring in geom_m["coordinates"]:
-            rings.append(list(_reproj_coords(ring)))
-        from shapely.geometry import Polygon
-        return Polygon(rings[0], holes=rings[1:]) if len(rings) > 0 else None
-    elif geom_m["type"] == "MultiPolygon":
+        for ring in gmap["coordinates"]:
+            rings.append([transformer.transform(x, y) for (x, y) in ring])
+        return Polygon(rings[0], holes=rings[1:]) if rings else None
+    elif gmap["type"] == "MultiPolygon":
+        transformer = Transformer.from_crs(f"EPSG:{src_epsg}", f"EPSG:{dst_epsg}", always_xy=True)
         polys = []
-        for poly in geom_m["coordinates"]:
+        for poly in gmap["coordinates"]:
             rings = []
             for ring in poly:
-                rings.append(list(_reproj_coords(ring)))
-            polys.append(rings)
-        from shapely.geometry import MultiPolygon, Polygon
-        return MultiPolygon([Polygon(r[0], holes=r[1:]) for r in polys])
+                rings.append([transformer.transform(x, y) for (x, y) in ring])
+            polys.append(Polygon(rings[0], holes=rings[1:]))
+        return MultiPolygon(polys)
     else:
-        from shapely.ops import transform as shp_transform
-        return shp_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
+        return _reproject_geom_generic(geom, src_epsg, dst_epsg)
+
+def _pick(props: Dict, *keys: str, default=None):
+    """Return the first present (and truthy) property among keys."""
+    for k in keys:
+        v = props.get(k)
+        if v not in (None, ""):
+            return v
+    return default
 
 def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
+    """
+    Returns a list of tuples:
+      (geom_4326, code, name, area_ha)
+    - Intersection is computed in EPSG:3857 for correct area (m²),
+      then geometry is reprojected to EPSG:4326 for rasterization.
+    - Code/name fields are read robustly from whatever the service exposes.
+    """
     parcel = to_shapely_union(parcel_fc_3857)
-    results = []
+    if parcel.is_empty:
+        return []
+
+    results: List[Tuple[Polygon, str, str, float]] = []
+
     for feat in landtypes_fc_3857["features"]:
-        props = feat.get("properties", {})
-        code = str(props.get("LT_CODE_1", "UNK"))
-        name = str(props.get("LT_NAME_1", "Unknown"))
+        props = feat.get("properties", {}) or {}
+        # Try multiple common field names seen across GLM/ILT layers
+        code = _pick(props, "LT_CODE_1", "LT_CODE", "LANDTYPE_CODE", "LTYPE_CODE", default="UNK")
+        name = _pick(props, "LT_NAME_1", "LT_NAME", "LANDTYPE_NAME", "LTYPE_NAME", default="Unknown")
+
         g = force_2d(shape(feat["geometry"]))
         if not g.is_valid or g.is_empty:
             continue
+
         inter = g.intersection(parcel)
         if inter.is_empty:
             continue
+
+        # Area in m² (native 3857 is meters); convert to hectares
+        area_m2 = inter.area
+        area_ha = float(area_m2 / 10000.0)
+
+        # Reproject clipped geometry to EPSG:4326 for rasterization
         inter4326 = reproject_geom(inter, 3857, 4326)
-        results.append((inter4326, code, name))
+        if inter4326 is None or inter4326.is_empty:
+            continue
+
+        results.append((inter4326, str(code), str(name), area_ha))
+
     return results
 
 def choose_raster_size(bounds4326: Tuple[float, float, float, float], max_px: int = 4096) -> Tuple[int, int]:
@@ -78,20 +115,30 @@ def choose_raster_size(bounds4326: Tuple[float, float, float, float], max_px: in
     return width, height
 
 def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
+    """
+    Rasterize clipped land type polygons to an RGBA GeoTIFF in EPSG:4326.
+    Transparent background with per-code deterministic color.
+    Returns summary dict {legend, bounds, path, width, height}.
+    Legend is de-duplicated by code and includes summed area_ha.
+    """
     if not shapes_clipped_4326:
         raise ValueError("No intersecting land type polygons found for this parcel.")
-    union = unary_union([g for g, _, _ in shapes_clipped_4326])
+
+    # Overall bounds in 4326
+    union = unary_union([g for (g, _code, _name, _ha) in shapes_clipped_4326])
     west, south, east, north = union.bounds
     width, height = choose_raster_size((west, south, east, north), max_px=max_px)
     transform = from_bounds(west, south, east, north, width, height)
 
-    codes = []
-    for _, code, _ in shapes_clipped_4326:
-        if code not in codes:
-            codes.append(code)
-    code_to_id = {c: i + 1 for i, c in enumerate(codes)}  # 0 background
+    # Assign ids per unique code
+    codes_order: List[str] = []
+    for (_g, code, _name, _ha) in shapes_clipped_4326:
+        if code not in codes_order:
+            codes_order.append(code)
+    code_to_id = {c: i + 1 for i, c in enumerate(codes_order)}  # 0 = background
 
-    shapes = [(mapping(g), code_to_id[c]) for g, c, _ in shapes_clipped_4326]
+    # Rasterize to class ids
+    shapes = [(mapping(g), code_to_id[c]) for (g, c, _n, _ha) in shapes_clipped_4326]
     class_raster = rasterize(
         shapes=shapes,
         out_shape=(height, width),
@@ -101,6 +148,7 @@ def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
         all_touched=False,
     )
 
+    # Build RGBA
     r = np.zeros((height, width), dtype=np.uint8)
     g = np.zeros((height, width), dtype=np.uint8)
     b = np.zeros((height, width), dtype=np.uint8)
@@ -124,7 +172,7 @@ def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
         "transform": transform,
         "tiled": False,
         "compress": "deflate",
-        "interleave": "pixel"
+        "interleave": "pixel",
     }
 
     with rasterio.open(out_path, "w", **profile) as dst:
@@ -133,9 +181,20 @@ def make_geotiff_rgba(shapes_clipped_4326, out_path: str, max_px: int = 4096):
         dst.write(b, 3)
         dst.write(a, 4)
 
-    legend = []
-    for (geom, code, name) in shapes_clipped_4326:
-        legend.append({"code": code, "name": name, "color": color_from_code(code)})
+    # De-duplicate legend and sum area per code
+    legend_map = {}
+    for (_geom, code, name, area_ha) in shapes_clipped_4326:
+        if code not in legend_map:
+            legend_map[code] = {
+                "code": code,
+                "name": name,
+                "color": color_from_code(code),
+                "area_ha": 0.0,
+            }
+        legend_map[code]["area_ha"] += float(area_ha)
+
+    # Stable order: by descending area, then code
+    legend = sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"]))
 
     return {
         "legend": legend,
