@@ -64,9 +64,8 @@ def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
     """
     Returns a list of tuples:
       (geom_4326, code, name, area_ha)
-    - Intersection is computed in EPSG:3857 for correct area (m²),
-      then geometry is reprojected to EPSG:4326 for rasterization.
-    - Code/name fields are read robustly from whatever the service exposes.
+    - Intersection computed in EPSG:3857 (for correct area), then reprojected to EPSG:4326.
+    - Attribute lookup is case-insensitive (handles lt_code_1 vs LT_CODE_1).
     """
     parcel = to_shapely_union(parcel_fc_3857)
     if parcel.is_empty:
@@ -75,10 +74,20 @@ def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
     results: List[Tuple[Polygon, str, str, float]] = []
 
     for feat in landtypes_fc_3857["features"]:
-        props = feat.get("properties", {}) or {}
-        # Try multiple common field names seen across GLM/ILT layers
-        code = _pick(props, "LT_CODE_1", "LT_CODE", "LANDTYPE_CODE", "LTYPE_CODE", default="UNK")
-        name = _pick(props, "LT_NAME_1", "LT_NAME", "LANDTYPE_NAME", "LTYPE_NAME", default="Unknown")
+        props_raw = (feat.get("properties", {}) or {})
+        # <<< key normalization: make a UPPER-CASE copy so lookups are case-insensitive
+        props = { (k.upper() if isinstance(k, str) else k): v for k, v in props_raw.items() }
+
+        def pick(*keys: str, default=None):
+            for k in keys:
+                v = props.get(k)
+                if v not in (None, ""):
+                    return v
+            return default
+
+        # Land Types commonly expose LT_CODE_1 / LT_NAME_1, but sometimes lower-case or alt names
+        code = pick("LT_CODE_1", "LT_CODE", "LANDTYPE_CODE", "LTYPE_CODE", default="UNK")
+        name = pick("LT_NAME_1", "LT_NAME", "LANDTYPE_NAME", "LTYPE_NAME", default="Unknown")
 
         g = force_2d(shape(feat["geometry"]))
         if not g.is_valid or g.is_empty:
@@ -88,11 +97,9 @@ def prepare_clipped_shapes(parcel_fc_3857: Dict, landtypes_fc_3857: Dict):
         if inter.is_empty:
             continue
 
-        # Area in m² (native 3857 is meters); convert to hectares
-        area_m2 = inter.area
-        area_ha = float(area_m2 / 10000.0)
+        # Area in hectares (native 3857 units are meters)
+        area_ha = float(inter.area / 10000.0)
 
-        # Reproject clipped geometry to EPSG:4326 for rasterization
         inter4326 = reproject_geom(inter, 3857, 4326)
         if inter4326 is None or inter4326.is_empty:
             continue
