@@ -14,20 +14,22 @@ LANDTYPES_LAYER = "https://spatial-gis.information.qld.gov.au/arcgis/rest/servic
 SR_3857 = {"wkid": 102100}
 SR_4326 = {"wkid": 4326}
 
-def _get(url: str, params: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+def _get(url: str, params: Dict[str, Any], timeout: int = 45) -> Dict[str, Any]:
     r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 def fetch_parcel_geojson(lotplan: str) -> Dict[str, Any]:
-    """Fetch a single parcel polygon by lotplan from the DCDB MapServer/4.
-    Returns GeoJSON FeatureCollection in EPSG:3857."""
+    """
+    Fetch a single parcel polygon by lotplan from the DCDB MapServer/4.
+    Returns GeoJSON FeatureCollection in EPSG:3857.
+    """
     params = {
         "f": "geojson",
         "where": f"UPPER(lotplan)=UPPER('{lotplan}')",
         "outFields": "*",
         "returnGeometry": "true",
-        "outSR": "102100",
+        "outSR": "102100",  # 3857
     }
     data = _get(CADASTRE_LAYER + "/query", params)
     if "features" not in data or len(data["features"]) == 0:
@@ -35,8 +37,10 @@ def fetch_parcel_geojson(lotplan: str) -> Dict[str, Any]:
     return data
 
 def fetch_landtypes_intersecting_envelope(envelope_3857: Tuple[float, float, float, float]) -> Dict[str, Any]:
-    """Query Land Types by envelope to avoid heavy polygon geometry param encoding.
-    Returns GeoJSON FeatureCollection (EPSG:3857)."""
+    """
+    Query Land Types by envelope to avoid heavy polygon geometry param encoding.
+    Returns GeoJSON FeatureCollection (EPSG:3857).
+    """
     xmin, ymin, xmax, ymax = envelope_3857
     geometry = {
         "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
@@ -48,7 +52,8 @@ def fetch_landtypes_intersecting_envelope(envelope_3857: Tuple[float, float, flo
         "geometryType": "esriGeometryEnvelope",
         "inSR": "102100",
         "spatialRel": "esriSpatialRelIntersects",
-        "outFields": "LT_CODE_1,LT_NAME_1,PERCENT1,AREA_HA",
+        # Ask for every attribute so we don't miss layer-specific field names
+        "outFields": "*",
         "returnGeometry": "true",
         "outSR": "102100"
     }
