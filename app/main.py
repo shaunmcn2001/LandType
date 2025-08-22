@@ -10,6 +10,9 @@ from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make
 from fastapi import Query
 from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope
 from .rendering import to_shapely_union, bbox_3857
+from .kml import build_kml, write_kmz
+from .colors import color_from_code
+
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
@@ -184,3 +187,46 @@ def debug_landtype_fields(lotplan: str = Query(..., description="QLD Lot/Plan"))
         props = feat.get("properties", {}) or {}
         props_list.append(sorted(list(props.keys())))
     return {"lotplan": lotplan, "sample_property_keys": props_list}
+@app.get("/export_kmz")
+def export_kmz(
+    lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13DP1246224 or 13SP181800"),
+    simplify_tolerance: float = Query(0.0, ge=0.0, le=0.001, description="Optional geometry simplify tolerance in degrees (e.g., 0.00005 ≈ 5 m)"),
+):
+    """
+    Returns a KMZ with clickable polygons. Each placemark popup shows Name, Code, Area (ha).
+    Optional: simplify geometries to reduce size.
+    """
+    try:
+        lotplan = lotplan.strip().upper()
+        parcel_fc = fetch_parcel_geojson(lotplan)
+        parcel_union = to_shapely_union(parcel_fc)
+        env = bbox_3857(parcel_union)
+        lt_fc = fetch_landtypes_intersecting_envelope(env)
+        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+        if not clipped:
+            raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+
+        # Optionally simplify to shrink KMZ (works in EPSG:4326 since we already reprojected)
+        if simplify_tolerance and simplify_tolerance > 0:
+            simplified = []
+            for geom4326, code, name, area_ha in clipped:
+                g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
+                if not g2.is_empty:
+                    simplified.append((g2, code, name, area_ha))
+            clipped = simplified or clipped
+
+        kml = build_kml(clipped, color_fn=color_from_code)
+
+        import tempfile, os
+        tmpdir = tempfile.mkdtemp(prefix="kmz_")
+        out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
+        write_kmz(kml, out_path)
+
+        filename = os.path.basename(out_path)
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return FileResponse(out_path, media_type="application/vnd.google-earth.kmz", filename=filename, headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("KMZ export error")
+        raise HTTPException(status_code=500, detail=str(e))
