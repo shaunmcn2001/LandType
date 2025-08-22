@@ -209,7 +209,7 @@ def export_kmz(
                     simplified.append((g2, code, name, area_ha))
             clipped = simplified or clipped
 
-        kml = build_kml(clipped, color_fn=color_from_code)
+        kml = build_kml(clipped,color_fn=color_from_code,folder_name=f"QLD Land Types – {lotplan}")
         tmpdir = tempfile.mkdtemp(prefix="kmz_")
         out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
         write_kmz(kml, out_path)
