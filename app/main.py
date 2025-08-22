@@ -7,6 +7,9 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
 from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope
 from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make_geotiff_rgba
+from fastapi import Query
+from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope
+from .rendering import to_shapely_union, bbox_3857
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
@@ -168,3 +171,16 @@ def export_geotiff(
     except Exception as e:
         logging.exception("Export error")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug/landtype-fields")
+def debug_landtype_fields(lotplan: str = Query(..., description="QLD Lot/Plan")):
+    lotplan = lotplan.strip().upper()
+    parcel_fc = fetch_parcel_geojson(lotplan)
+    env = bbox_3857(to_shapely_union(parcel_fc))
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    # Return the keys of the first few features so we see what's really there
+    props_list = []
+    for feat in lt_fc.get("features", [])[:5]:
+        props = feat.get("properties", {}) or {}
+        props_list.append(sorted(list(props.keys())))
+    return {"lotplan": lotplan, "sample_property_keys": props_list}
