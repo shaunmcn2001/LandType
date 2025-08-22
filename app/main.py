@@ -3,7 +3,7 @@ import tempfile
 import logging
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
 from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope
 from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make_geotiff_rgba
@@ -11,8 +11,8 @@ from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types → GeoTIFF",
-    description="Enter a QLD Lot/Plan (e.g. 13SP181800); get Land Types over the parcel boundary as a GeoTIFF for Google Earth.",
-    version="1.0.0",
+    description="Enter a QLD Lot/Plan (e.g. 13DP1246224 or 13SP181800); get Land Types over the parcel boundary as a GeoTIFF for Google Earth.",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -23,18 +23,132 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- UI: Homepage ----------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QLD Land Types → GeoTIFF</title>
+  <style>
+    :root { --bg:#0b1220; --card:#121a2b; --text:#e8eefc; --muted:#9fb2d8; --accent:#6aa6ff; }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
+    .wrap{max-width:880px;margin:40px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid #1f2a44;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);padding:24px}
+    h1{margin:0 0 6px;font-size:28px} p{margin:0 0 18px;color:var(--muted)}
+    label{display:block;margin:14px 0 6px;color:var(--muted);font-size:14px}
+    input[type=text],input[type=number]{width:100%;padding:12px 14px;border-radius:12px;border:1px solid #2b3960;background:#0e1526;color:var(--text);outline:none}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .row > *{flex:1 1 220px}
+    .btns{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+    button,.ghost{appearance:none;border:0;border-radius:12px;padding:12px 16px;font-weight:600;cursor:pointer}
+    button.primary{background:var(--accent);color:#071021}
+    a.ghost{color:var(--accent);text-decoration:none;border:1px solid #294a86;background:#0d1730}
+    .note{margin-top:10px;font-size:13px;color:#89a3d6}
+    .out{margin-top:18px;border-top:1px solid #203055;padding-top:14px;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;white-space:pre-wrap}
+    .link{display:inline-block;margin-top:10px}
+    .badge{display:inline-block;padding:.2rem .5rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px;margin-left:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>QLD Land Types → GeoTIFF <span class="badge">EPSG:4326</span></h1>
+      <p>Enter a Queensland <strong>Lot / Plan</strong> like <code>13DP1246224</code> or <code>13SP181800</code>. We’ll fetch the parcel, intersect Land Types, and return a Google‑Earth‑ready GeoTIFF (RGBA, transparent background).</p>
+
+      <label for="lotplan">Lot / Plan</label>
+      <input id="lotplan" type="text" placeholder="e.g. 13DP1246224" autocomplete="off" />
+
+      <div class="row">
+        <div>
+          <label for="maxpx">Max raster dimension (px)</label>
+          <input id="maxpx" type="number" min="256" max="8192" value="4096" />
+        </div>
+        <div>
+          <label for="mode">Output</label>
+          <div class="row">
+            <button class="primary" id="btn-download">Download GeoTIFF</button>
+            <a class="ghost" id="btn-json" href="#">View JSON summary</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="note">
+        Tips: Use uppercase Lot/Plan (we’ll normalise). Try <code>13SP181800</code> if you want a quick test. See <a href="/docs">/docs</a> for API.
+      </div>
+
+      <div id="out" class="out"></div>
+    </div>
+  </div>
+
+  <script>
+    const $lot = document.getElementById('lotplan');
+    const $max = document.getElementById('maxpx');
+    const $btnDl = document.getElementById('btn-download');
+    const $btnJs = document.getElementById('btn-json');
+    const $out = document.getElementById('out');
+
+    function normLot(s){ return (s || '').trim().toUpperCase(); }
+
+    function mkUrl(download){
+      const lotplan = encodeURIComponent(normLot($lot.value));
+      const maxpx = encodeURIComponent(($max.value || '4096').trim());
+      return `/export?lotplan=${lotplan}&max_px=${maxpx}&download=${download ? 'true' : 'false'}`;
+    }
+
+    $btnDl.addEventListener('click', (e) => {
+      e.preventDefault();
+      const lot = normLot($lot.value);
+      if(!lot){ $out.textContent = 'Enter a Lot/Plan first.'; return; }
+      // Navigate to trigger a file download
+      window.location.href = mkUrl(true);
+      $out.textContent = 'Generating GeoTIFF… If a download doesn’t start, check the service logs or try View JSON summary.';
+    });
+
+    $btnJs.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const lot = normLot($lot.value);
+      if(!lot){ $out.textContent = 'Enter a Lot/Plan first.'; return; }
+      $out.textContent = 'Requesting JSON summary…';
+      try{
+        const res = await fetch(mkUrl(false));
+        if(!res.ok){
+          const txt = await res.text();
+          $out.textContent = `Error ${res.status}: ${txt}`;
+          return;
+        }
+        const data = await res.json();
+        $out.textContent = JSON.stringify(data, null, 2);
+      }catch(err){
+        $out.textContent = 'Network error: ' + err;
+      }
+    });
+
+    // Convenience: focus input on load
+    setTimeout(()=>{ $lot.focus(); }, 50);
+  </script>
+</body>
+</html>"""
+
+# ---------- API: Health ----------
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# ---------- API: Export ----------
 @app.get("/export")
 def export_geotiff(
-    lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13SP181800"),
+    lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13DP1246224 or 13SP181800"),
     max_px: int = Query(4096, ge=256, le=8192, description="Max raster dimension (px)"),
     download: bool = Query(True, description="Return file download (True) or JSON summary (False)"),
 ):
     try:
-        parcel_fc = fetch_parcel_geojson(lotplan.strip())
+        # Normalise lotplan to uppercase and strip spaces
+        lotplan = lotplan.strip().upper()
+
+        parcel_fc = fetch_parcel_geojson(lotplan)
         parcel_union = to_shapely_union(parcel_fc)
         env = bbox_3857(parcel_union)
         lt_fc = fetch_landtypes_intersecting_envelope(env)
