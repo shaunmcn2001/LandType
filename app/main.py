@@ -1,8 +1,10 @@
+# app/main.py
 import os, tempfile, logging, zipfile, csv, datetime as dt
 from io import BytesIO
-from typing import List, Optional, Dict, Any, Tuple, Literal
+from enum import Enum
+from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -12,65 +14,37 @@ from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make
 from .colors import color_from_code
 from .kml import build_kml, write_kmz
 
+# ───────────────────────────────────────── App / CORS ─────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
-    title="QLD Land Types → GeoTIFF + Map + KMZ",
-    description="Enter a QLD Lot/Plan; download GeoTIFF, clickable KMZ, or both. Single or bulk from one box.",
-    version="2.1.0",
+    title="QLD Land Types → GeoTIFF + KMZ (Unified)",
+    description="Single or bulk export from one box: GeoTIFF, clickable KMZ, or both.",
+    version="2.3.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],  # POST for combined/bulk
+    allow_methods=["*"],  # include OPTIONS for browser preflights
     allow_headers=["*"],
 )
 
+# ───────────────────────────────────────── Helpers ─────────────────────────────────────────
 def rgb_to_hex(rgb):
     r, g, b = rgb
     return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
 def _sanitize_filename(s: str) -> str:
-    base = "".join(c for c in s.strip() if c.isalnum() or c in ("_", "-", ".", " ")).strip()
-    return base or "download"
+    base = "".join(c for c in (s or "").strip() if c.isalnum() or c in ("_", "-", ".", " "))
+    return (base or "download").strip()
 
-def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[str, Any]]:
-    """
-    Builds a GeoTIFF for a single lot/plan and returns (tiff_bytes, meta).
-    Meta includes simple bounds and total area (ha).
-    """
-    lotplan = lotplan.strip().upper()
-    parcel_fc = fetch_parcel_geojson(lotplan)
-    parcel_union = to_shapely_union(parcel_fc)
-    env = bbox_3857(parcel_union)
-    lt_fc = fetch_landtypes_intersecting_envelope(env)
-    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-    if not clipped:
-        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-
-    tmpdir = tempfile.mkdtemp(prefix="geotiff_")
-    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.tif")
-    try:
-        result = make_geotiff_rgba(clipped, out_path, max_px=max_px)
-        with open(out_path, "rb") as f:
-            tiff_bytes = f.read()
-    finally:
-        try:
-            if os.path.exists(out_path): os.remove(out_path)
-            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-        except Exception:
-            pass
-
-    west, south, east, north = to_shapely_union(parcel_fc).bounds
-    total_area_ha = sum(float(a_ha) for _, _, _, a_ha in clipped)
-    meta = {
-        "lotplan": lotplan,
-        "bounds_epsg4326": [west, south, east, north],
-        "area_ha_total": total_area_ha,
-        **{k: v for k, v in result.items() if k != "path"}
-    }
-    return tiff_bytes, meta
+def _require_parcel_fc(lotplan: str) -> Dict[str, Any]:
+    """Fetch parcel FeatureCollection or raise a clean 404."""
+    fc = fetch_parcel_geojson(lotplan)
+    if not fc or not isinstance(fc, dict) or fc.get("type") != "FeatureCollection" or not fc.get("features"):
+        raise HTTPException(status_code=404, detail=f"Parcel not found for lot/plan '{lotplan}'.")
+    return fc
 
 def _build_kml_compat(clipped, folder_label: str):
     """
@@ -87,14 +61,60 @@ def _build_kml_compat(clipped, folder_label: str):
             raise
     return build_kml(clipped, color_fn=color_from_code)
 
+def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    Builds a GeoTIFF for a single lot/plan and returns (tiff_bytes, meta).
+    """
+    lotplan = (lotplan or "").strip().upper()
+    if not lotplan:
+        raise HTTPException(status_code=400, detail="lotplan is required")
+
+    parcel_fc = _require_parcel_fc(lotplan)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    if not clipped:
+        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+
+    tmpdir = tempfile.mkdtemp(prefix="geotiff_")
+    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.tif")
+    try:
+        result = make_geotiff_rgba(clipped, out_path, max_px=max_px)
+        with open(out_path, "rb") as f:
+            tiff_bytes = f.read()
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            if os.path.isdir(tmpdir):
+                os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    west, south, east, north = parcel_union.bounds
+    total_area_ha = sum(float(a_ha) for _, _, _, a_ha in clipped)
+    meta = {
+        "lotplan": lotplan,
+        "bounds_epsg4326": [west, south, east, north],
+        "area_ha_total": total_area_ha,
+        **{k: v for k, v in result.items() if k != "path"}
+    }
+    return tiff_bytes, meta
+
 def _render_one_kmz_and_meta(lotplan: str, simplify_tolerance: float = 0.0) -> Tuple[bytes, Dict[str, Any]]:
     """
     Builds a KMZ (clickable) and returns (kmz_bytes, meta).
     """
-    lotplan = lotplan.strip().upper()
-    parcel_fc = fetch_parcel_geojson(lotplan)
+    lotplan = (lotplan or "").strip().upper()
+    if not lotplan:
+        raise HTTPException(status_code=400, detail="lotplan is required")
+
+    parcel_fc = _require_parcel_fc(lotplan)
     parcel_union = to_shapely_union(parcel_fc)
     env = bbox_3857(parcel_union)
+
     lt_fc = fetch_landtypes_intersecting_envelope(env)
     clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
     if not clipped:
@@ -118,8 +138,10 @@ def _render_one_kmz_and_meta(lotplan: str, simplify_tolerance: float = 0.0) -> T
             kmz_bytes = f.read()
     finally:
         try:
-            if os.path.exists(out_path): os.remove(out_path)
-            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            if os.path.isdir(tmpdir):
+                os.rmdir(tmpdir)
         except Exception:
             pass
 
@@ -132,7 +154,13 @@ def _render_one_kmz_and_meta(lotplan: str, simplify_tolerance: float = 0.0) -> T
     }
     return kmz_bytes, meta
 
-# ---------------------- Unified UI (single input for single+bulk) ----------------------
+# Global exception handler → logs full stack, returns JSON with detail
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logging.exception("Unhandled error during %s %s", request.method, request.url)
+    return JSONResponse(status_code=500, content={"error": "internal_server_error", "detail": str(exc)})
+
+# ───────────────────────────────────────── UI (Unified) ─────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html>
@@ -208,7 +236,6 @@ def home():
           $btnLoad = document.getElementById('btn-load');
 
     function normText(s){ return (s || '').trim(); }
-    function normLot(s){ return (s || '').trim().toUpperCase(); }
     function parseItems(text){
       const raw = (text || '').split(/\\r?\\n|,|;/);
       const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -233,12 +260,12 @@ def home():
 
       if (n === 1){
         $mode.textContent = "Mode: Single";
-        $btnJson.classList.remove('disabled'); $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
-        $btnLoad.classList.remove('disabled'); $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
+        $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
+        $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
       } else {
         $mode.textContent = `Mode: Bulk (${n})`;
-        $btnJson.classList.add('disabled'); $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
-        $btnLoad.classList.add('disabled'); $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
+        $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
+        $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
       }
     }
 
@@ -251,7 +278,6 @@ def home():
       URL.revokeObjectURL(url);
     }
 
-    // Vector preview (single only)
     function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
 
     async function loadVector(){
@@ -275,7 +301,6 @@ def home():
       }catch(err){ $out.textContent = 'Network error: ' + err; }
     }
 
-    // JSON preview (single only)
     async function previewJson(){
       const items = parseItems($items.value);
       if (items.length !== 1){ $out.textContent = 'Provide exactly one Lot/Plan for JSON preview.'; return; }
@@ -288,7 +313,6 @@ def home():
       }catch(err){ $out.textContent = 'Network error: ' + err; }
     }
 
-    // Unified Export handler (single or bulk)
     async function exportAny(){
       const items = parseItems($items.value);
       if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan.'; return; }
@@ -309,34 +333,57 @@ def home():
       $out.textContent = items.length === 1 ? 'Exporting…' : `Exporting ${items.length} items…`;
       try{
         const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-        if (!res.ok){ const txt = await res.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
-
         const disp = res.headers.get('content-disposition') || '';
+        if (!res.ok){ const txt = await res.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
         const m = /filename="([^"]+)"/i.exec(disp);
         let dl = m ? m[1] : `export_${Date.now()}`;
-        // If bulk and name provided as prefix, ensure filename begins with it
         if (items.length > 1 && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
         await downloadBlobAs(res, dl);
         $out.textContent = 'Download complete.';
       }catch(err){ $out.textContent = 'Network error: ' + err; }
     }
 
-    // Wire UI
     $items.addEventListener('input', updateMode);
-    $btnLoad.addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
-    $btnJson.addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
-    $btnExport.addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
-
-    updateMode();
-    setTimeout(()=>{ $items.focus(); }, 50);
+    document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
+    document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
+    document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
+    updateMode(); setTimeout(()=>{ $items.focus(); }, 50);
   </script>
 </body></html>"""
 
+# ───────────────────────────────────────── Health / Debug ─────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ---------------------- Existing single endpoints (kept) ----------------------
+@app.get("/debug/diag")
+def debug_diag(lotplan: str = Query("13SP181800"), simplify_tolerance: float = 0.0, max_px: int = 1024):
+    """Low-cost end-to-end smoke test to expose where a 500 originates."""
+    try:
+        lp = lotplan.strip().upper()
+        parcel_fc = _require_parcel_fc(lp)
+        parcel_union = to_shapely_union(parcel_fc)
+        env = bbox_3857(parcel_union)
+        lt_fc = fetch_landtypes_intersecting_envelope(env)
+        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+        has_clipped = bool(clipped)
+        # Try tiny outputs to catch IO errors
+        tiff_bytes, _ = _render_one_tiff_and_meta(lp, max_px=max_px)
+        kmz_bytes, _ = _render_one_kmz_and_meta(lp, simplify_tolerance=simplify_tolerance)
+        return {
+            "lotplan": lp,
+            "parcel_features": len(parcel_fc.get("features", [])),
+            "has_clipped": has_clipped,
+            "tiff_ok": bool(tiff_bytes),
+            "kmz_ok": bool(kmz_bytes),
+        }
+    except HTTPException as he:
+        return JSONResponse(status_code=he.status_code, content={"error": he.detail})
+    except Exception as e:
+        logging.exception("diag failed")
+        return JSONResponse(status_code=500, content={"error": "diag_failed", "detail": str(e)})
+
+# ───────────────────────────────────────── Compatibility endpoints ─────────────────────────────────────────
 @app.get("/export")
 def export_geotiff(
     lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13DP1246224 or 13SP181800"),
@@ -346,7 +393,7 @@ def export_geotiff(
 ):
     try:
         lotplan = lotplan.strip().upper()
-        parcel_fc = fetch_parcel_geojson(lotplan)
+        parcel_fc = _require_parcel_fc(lotplan)
         parcel_union = to_shapely_union(parcel_fc)
         env = bbox_3857(parcel_union)
         lt_fc = fetch_landtypes_intersecting_envelope(env)
@@ -359,11 +406,7 @@ def export_geotiff(
         result = make_geotiff_rgba(clipped, out_path, max_px=max_px)
 
         if download:
-            if filename:
-                dl = _sanitize_filename(filename)
-                if not dl.lower().endswith(".tif"): dl += ".tif"
-            else:
-                dl = os.path.basename(out_path)
+            dl = _sanitize_filename(filename) + ".tif" if filename else os.path.basename(out_path)
             return FileResponse(out_path, media_type="image/tiff", filename=dl)
         else:
             result_public = {k: v for k, v in result.items() if k != "path"}
@@ -378,7 +421,7 @@ def export_geotiff(
 def vector_geojson(lotplan: str = Query(..., description="QLD Lot/Plan")):
     try:
         lotplan = lotplan.strip().upper()
-        parcel_fc = fetch_parcel_geojson(lotplan)
+        parcel_fc = _require_parcel_fc(lotplan)
         parcel_union = to_shapely_union(parcel_fc)
         env = bbox_3857(parcel_union)
         lt_fc = fetch_landtypes_intersecting_envelope(env)
@@ -401,15 +444,21 @@ def vector_geojson(lotplan: str = Query(..., description="QLD Lot/Plan")):
                 legend_map[code] = {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0}
             legend_map[code]["area_ha"] += float(area_ha)
 
-        union_bounds = to_shapely_union({"type":"FeatureCollection","features":[{"type":"Feature","geometry":f["geometry"],"properties":{}} for f in features]}).bounds
+        union_bounds = to_shapely_union({
+            "type":"FeatureCollection",
+            "features":[{"type":"Feature","geometry":f["geometry"],"properties":{}} for f in features]
+        }).bounds
         west, south, east, north = union_bounds
+
         return JSONResponse({
             "lotplan": lotplan,
             "parcel": parcel_fc,
             "landtypes": { "type":"FeatureCollection", "features": features },
             "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
-            "bounds4326": {"west": west, "south": south, "east": north, "north": north}
+            "bounds4326": {"west": west, "south": south, "east": east, "north": north}
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("Vector export error")
         raise HTTPException(status_code=500, detail=str(e))
@@ -438,83 +487,24 @@ def export_kmz(
         logging.exception("KMZ export error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------------------- Original bulk TIFF endpoint (kept) ----------------------
-class BulkRequest(BaseModel):
-    lotplans: List[str] = Field(..., description="List of QLD Lot/Plan codes")
-    max_px: int = Field(4096, ge=256, le=8192)
-    download: bool = Field(True, description="If false, returns JSON list of summaries instead of ZIP")
-    filename_prefix: Optional[str] = Field(None, description="Optional prefix for file names inside the ZIP")
+# ───────────────────────────────────────── Unified endpoint ─────────────────────────────────────────
+class FormatEnum(str, Enum):
+    tiff = "tiff"
+    kmz = "kmz"
+    both = "both"
 
-@app.post("/export/bulk")
-def export_bulk(payload: BulkRequest = Body(...)):
-    seen = set()
-    lotplans: List[str] = []
-    for lp in (lp.strip().upper() for lp in payload.lotplans):
-        if not lp: continue
-        if lp in seen: continue
-        seen.add(lp); lotplans.append(lp)
-    if not lotplans:
-        raise HTTPException(status_code=400, detail="No valid lotplans provided.")
-
-    if not payload.download:
-        out: List[Dict[str, Any]] = []
-        for lp in lotplans:
-            try:
-                tiff_bytes, meta = _render_one_tiff_and_meta(lp, payload.max_px)
-                out.append({"lotplan": lp, "ok": True, **{k: v for k, v in meta.items() if k != "path"}})
-            except HTTPException as e:
-                out.append({"lotplan": lp, "ok": False, "message": e.detail})
-            except Exception as e:
-                out.append({"lotplan": lp, "ok": False, "message": str(e)})
-        return JSONResponse(content=out)
-
-    prefix = _sanitize_filename(payload.filename_prefix) if payload.filename_prefix else None
-    zip_buf = BytesIO()
-    manifest_rows: List[Dict[str, Any]] = []
-
-    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for lp in lotplans:
-            try:
-                tiff_bytes, meta = _render_one_tiff_and_meta(lp, payload.max_px)
-                base = f"{prefix}_" if prefix else ""
-                tif_name = f"{base}{lp}_landtypes.tif"
-                zf.writestr(tif_name, tiff_bytes)
-                manifest_rows.append({
-                    "lotplan": lp, "status": "ok", "file": tif_name,
-                    "bounds_epsg4326": meta.get("bounds_epsg4326"), "area_ha_total": meta.get("area_ha_total")
-                })
-            except HTTPException as e:
-                manifest_rows.append({"lotplan": lp, "status": f"error:{e.status_code}", "file": "", "message": e.detail})
-            except Exception as e:
-                manifest_rows.append({"lotplan": lp, "status": "error:500", "file": "", "message": str(e)})
-
-        mem_csv = BytesIO()
-        fieldnames = ["lotplan","status","file","bounds_epsg4326","area_ha_total","message"]
-        writer = csv.DictWriter(mem_csv, fieldnames=fieldnames); writer.writeheader()
-        for row in manifest_rows:
-            for k in fieldnames: row.setdefault(k, "")
-            writer.writerow(row)
-        zf.writestr("manifest.csv", mem_csv.getvalue())
-
-    zip_buf.seek(0)
-    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    dl_name = f"{(prefix + '_' ) if prefix else ''}landtypes_bulk_{stamp}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{dl_name}"'}
-    return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
-
-# ---------------------- Unified single/bulk endpoint ----------------------
 class ExportAnyRequest(BaseModel):
     lotplan: Optional[str] = Field(None, description="Single QLD Lot/Plan")
     lotplans: Optional[List[str]] = Field(None, description="Multiple QLD Lot/Plan codes")
     max_px: int = Field(4096, ge=256, le=8192)
-    format: Literal["tiff","kmz","both"] = "tiff"
+    format: FormatEnum = Field(FormatEnum.tiff)
     filename: Optional[str] = Field(None, description="Custom filename for single-file responses (no extension)")
     filename_prefix: Optional[str] = Field(None, description="Prefix for files inside ZIP when multiple outputs")
     simplify_tolerance: float = Field(0.0, ge=0.0, le=0.001, description="Simplify polygons for KMZ")
 
 @app.post("/export/any")
 def export_any(payload: ExportAnyRequest = Body(...)):
-    # Normalize the list of lotplans
+    # Normalize inputs
     items: List[str] = []
     if payload.lotplans:
         seen = set()
@@ -530,31 +520,26 @@ def export_any(payload: ExportAnyRequest = Body(...)):
     if not items:
         raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
 
-    # Decide whether output is a single file or ZIP
-    multi_files = (len(items) > 1) or (payload.format == "both")
+    multi_files = (len(items) > 1) or (payload.format == FormatEnum.both)
 
+    # Single file
     if not multi_files:
-        # Single lot + single format → return a single file (no ZIP)
         lp = items[0]
-        if payload.format == "tiff":
-            tiff_bytes, _meta = _render_one_tiff_and_meta(lp, payload.max_px)
+        if payload.format == FormatEnum.tiff:
+            tiff_bytes, _ = _render_one_tiff_and_meta(lp, payload.max_px)
             name = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not name.lower().endswith(".tif"): name += ".tif"
-            buf = BytesIO(tiff_bytes)
-            headers = {"Content-Disposition": f'attachment; filename="{name}"'}
-            return StreamingResponse(buf, media_type="image/tiff", headers=headers)
-
-        if payload.format == "kmz":
-            kmz_bytes, _meta = _render_one_kmz_and_meta(lp, simplify_tolerance=payload.simplify_tolerance)
+            return StreamingResponse(BytesIO(tiff_bytes), media_type="image/tiff",
+                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
+        if payload.format == FormatEnum.kmz:
+            kmz_bytes, _ = _render_one_kmz_and_meta(lp, simplify_tolerance=payload.simplify_tolerance)
             name = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not name.lower().endswith(".kmz"): name += ".kmz"
-            buf = BytesIO(kmz_bytes)
-            headers = {"Content-Disposition": f'attachment; filename="{name}"'}
-            return StreamingResponse(buf, media_type="application/vnd.google-earth.kmz", headers=headers)
-
+            return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz",
+                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
         raise HTTPException(status_code=400, detail="Unsupported format for single export.")
 
-    # Otherwise, ZIP with one/more files per lotplan
+    # ZIP
     prefix = _sanitize_filename(payload.filename_prefix) if payload.filename_prefix else None
     zip_buf = BytesIO()
     manifest_rows: List[Dict[str, Any]] = []
@@ -562,15 +547,15 @@ def export_any(payload: ExportAnyRequest = Body(...)):
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for lp in items:
             row: Dict[str, Any] = {"lotplan": lp}
-            # TIFF
-            if payload.format in ("tiff","both"):
+
+            if payload.format in (FormatEnum.tiff, FormatEnum.both):
                 try:
                     tiff_bytes, meta = _render_one_tiff_and_meta(lp, payload.max_px)
-                    name = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
-                    zf.writestr(name, tiff_bytes)
+                    name_tif = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
+                    zf.writestr(name_tif, tiff_bytes)
                     row.update({
                         "status_tiff": "ok",
-                        "file_tiff": name,
+                        "file_tiff": name_tif,
                         "bounds_epsg4326": meta.get("bounds_epsg4326"),
                         "area_ha_total": meta.get("area_ha_total"),
                     })
@@ -579,15 +564,14 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                 except Exception as e:
                     row.update({"status_tiff": "error:500", "file_tiff": "", "tiff_message": str(e)})
 
-            # KMZ
-            if payload.format in ("kmz","both"):
+            if payload.format in (FormatEnum.kmz, FormatEnum.both):
                 try:
                     kmz_bytes, meta2 = _render_one_kmz_and_meta(lp, simplify_tolerance=payload.simplify_tolerance)
-                    name = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
-                    zf.writestr(name, kmz_bytes)
+                    name_kmz = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
+                    zf.writestr(name_kmz, kmz_bytes)
                     row.update({
                         "status_kmz": "ok",
-                        "file_kmz": name,
+                        "file_kmz": name_kmz,
                         "bounds_epsg4326": row.get("bounds_epsg4326", meta2.get("bounds_epsg4326")),
                         "area_ha_total": row.get("area_ha_total", meta2.get("area_ha_total")),
                     })
@@ -598,14 +582,12 @@ def export_any(payload: ExportAnyRequest = Body(...)):
 
             manifest_rows.append(row)
 
-        # Manifest CSV
         mem_csv = BytesIO()
-        fieldnames = [
-            "lotplan","status_tiff","file_tiff","tiff_message",
-            "status_kmz","file_kmz","kmz_message",
-            "bounds_epsg4326","area_ha_total"
-        ]
-        writer = csv.DictWriter(mem_csv, fieldnames=fieldnames); writer.writeheader()
+        fieldnames = ["lotplan","status_tiff","file_tiff","tiff_message",
+                      "status_kmz","file_kmz","kmz_message",
+                      "bounds_epsg4326","area_ha_total"]
+        writer = csv.DictWriter(mem_csv, fieldnames=fieldnames)
+        writer.writeheader()
         for row in manifest_rows:
             for k in fieldnames: row.setdefault(k, "")
             writer.writerow(row)
@@ -613,7 +595,6 @@ def export_any(payload: ExportAnyRequest = Body(...)):
 
     zip_buf.seek(0)
     stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base = f"{prefix+'_' if prefix else ''}landtypes_{payload.format}"
-    dl_name = f"{base}_bulk_{stamp}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{dl_name}"'}
-    return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+    base = f"{prefix+'_' if prefix else ''}landtypes_{payload.format.value}"
+    return StreamingResponse(zip_buf, media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{base}_bulk_{stamp}.zip"'})
