@@ -6,36 +6,36 @@ from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope
 from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make_geotiff_rgba
 from .colors import color_from_code
-from .kml import build_kml, write_kmz
+from .kml import build_kml, write_kmz  # NOTE: we’re shipping a compatible kml.py below
 
 # ───────────────────────────────────────── App / CORS ─────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types → GeoTIFF + KMZ (Unified)",
     description="Single or bulk export from one box: GeoTIFF, clickable KMZ, or both.",
-    version="2.3.0",
+    version="2.4.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],  # include OPTIONS for browser preflights
+    allow_methods=["*"],  # includes OPTIONS for preflights
     allow_headers=["*"],
 )
 
 # ───────────────────────────────────────── Helpers ─────────────────────────────────────────
 def rgb_to_hex(rgb):
     r, g, b = rgb
-    return "#{:02x}{:02x}{:02x}".format(r, g, b)
+    return "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
 
-def _sanitize_filename(s: str) -> str:
+def _sanitize_filename(s: Optional[str]) -> str:
     base = "".join(c for c in (s or "").strip() if c.isalnum() or c in ("_", "-", ".", " "))
     return (base or "download").strip()
 
@@ -56,14 +56,16 @@ def _build_kml_compat(clipped, folder_label: str):
             return build_kml(clipped, color_fn=color_from_code, **{kw: folder_label})
         except TypeError as e:
             msg = str(e)
-            if "unexpected keyword argument" in msg or "got multiple values for" in msg:
+            if "unexpected keyword argument" in msg or "got multiple values" in msg:
                 continue
             raise
+    # last resort: no label kwarg
     return build_kml(clipped, color_fn=color_from_code)
 
 def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[str, Any]]:
     """
     Builds a GeoTIFF for a single lot/plan and returns (tiff_bytes, meta).
+    Meta includes simple bounds and total area (ha).
     """
     lotplan = (lotplan or "").strip().upper()
     if not lotplan:
@@ -85,11 +87,10 @@ def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[st
         with open(out_path, "rb") as f:
             tiff_bytes = f.read()
     finally:
+        # clean temp files
         try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            if os.path.isdir(tmpdir):
-                os.rmdir(tmpdir)
+            if os.path.exists(out_path): os.remove(out_path)
+            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
         except Exception:
             pass
 
@@ -99,7 +100,7 @@ def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[st
         "lotplan": lotplan,
         "bounds_epsg4326": [west, south, east, north],
         "area_ha_total": total_area_ha,
-        **{k: v for k, v in result.items() if k != "path"}
+        **{k: v for k, v in (result or {}).items() if k != "path"}
     }
     return tiff_bytes, meta
 
@@ -138,10 +139,8 @@ def _render_one_kmz_and_meta(lotplan: str, simplify_tolerance: float = 0.0) -> T
             kmz_bytes = f.read()
     finally:
         try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            if os.path.isdir(tmpdir):
-                os.rmdir(tmpdir)
+            if os.path.exists(out_path): os.remove(out_path)
+            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
         except Exception:
             pass
 
@@ -357,7 +356,7 @@ def health():
     return {"ok": True}
 
 @app.get("/debug/diag")
-def debug_diag(lotplan: str = Query("13SP181800"), simplify_tolerance: float = 0.0, max_px: int = 1024):
+def debug_diag(lotplan: str = Query("13SP181800"), simplify_tolerance: float = 0.0, max_px: int = 512):
     """Low-cost end-to-end smoke test to expose where a 500 originates."""
     try:
         lp = lotplan.strip().upper()
@@ -367,7 +366,7 @@ def debug_diag(lotplan: str = Query("13SP181800"), simplify_tolerance: float = 0
         lt_fc = fetch_landtypes_intersecting_envelope(env)
         clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
         has_clipped = bool(clipped)
-        # Try tiny outputs to catch IO errors
+        # Tiny outputs to catch IO errors
         tiff_bytes, _ = _render_one_tiff_and_meta(lp, max_px=max_px)
         kmz_bytes, _ = _render_one_kmz_and_meta(lp, simplify_tolerance=simplify_tolerance)
         return {
@@ -393,24 +392,16 @@ def export_geotiff(
 ):
     try:
         lotplan = lotplan.strip().upper()
-        parcel_fc = _require_parcel_fc(lotplan)
-        parcel_union = to_shapely_union(parcel_fc)
-        env = bbox_3857(parcel_union)
-        lt_fc = fetch_landtypes_intersecting_envelope(env)
-        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-        if not clipped:
-            raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-
-        tmpdir = tempfile.mkdtemp(prefix="geotiff_")
-        out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.tif")
-        result = make_geotiff_rgba(clipped, out_path, max_px=max_px)
-
         if download:
-            dl = _sanitize_filename(filename) + ".tif" if filename else os.path.basename(out_path)
-            return FileResponse(out_path, media_type="image/tiff", filename=dl)
+            tiff_bytes, meta = _render_one_tiff_and_meta(lotplan, max_px)
+            name = _sanitize_filename(filename) if filename else f"{meta['lotplan']}_landtypes"
+            if not name.lower().endswith(".tif"): name += ".tif"
+            return StreamingResponse(BytesIO(tiff_bytes), media_type="image/tiff",
+                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
         else:
-            result_public = {k: v for k, v in result.items() if k != "path"}
-            return JSONResponse({"lotplan": lotplan, **result_public})
+            _bytes, meta = _render_one_tiff_and_meta(lotplan, max_px)
+            meta.pop("path", None)
+            return JSONResponse({"lotplan": meta["lotplan"], **meta})
     except HTTPException:
         raise
     except Exception as e:
@@ -433,15 +424,13 @@ def vector_geojson(lotplan: str = Query(..., description="QLD Lot/Plan")):
         legend_map = {}
         from shapely.geometry import mapping as shp_mapping
         for geom4326, code, name, area_ha in clipped:
-            color_rgb = color_from_code(code)
-            color_hex = rgb_to_hex(color_rgb)
+            color_hex = rgb_to_hex(color_from_code(code))
             features.append({
                 "type": "Feature",
                 "geometry": shp_mapping(geom4326),
                 "properties": {"code": code, "name": name, "area_ha": float(area_ha), "color_hex": color_hex}
             })
-            if code not in legend_map:
-                legend_map[code] = {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0}
+            legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
             legend_map[code]["area_ha"] += float(area_ha)
 
         union_bounds = to_shapely_union({
@@ -472,15 +461,10 @@ def export_kmz(
     try:
         lotplan = lotplan.strip().upper()
         kmz_bytes, _meta = _render_one_kmz_and_meta(lotplan, simplify_tolerance=simplify_tolerance)
-        if filename:
-            dl = _sanitize_filename(filename)
-            if not dl.lower().endswith(".kmz"): dl += ".kmz"
-        else:
-            dl = f"{lotplan}_landtypes.kmz"
-
-        buf = BytesIO(kmz_bytes)
-        headers = {"Content-Disposition": f'attachment; filename="{dl}"'}
-        return StreamingResponse(buf, media_type="application/vnd.google-earth.kmz", headers=headers)
+        name = _sanitize_filename(filename) if filename else f"{lotplan}_landtypes"
+        if not name.lower().endswith(".kmz"): name += ".kmz"
+        return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz",
+                                 headers={"Content-Disposition": f'attachment; filename="{name}"'})
     except HTTPException:
         raise
     except Exception as e:
