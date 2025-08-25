@@ -15,8 +15,8 @@ from .kml import build_kml, write_kmz
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types → GeoTIFF + Map + KMZ",
-    description="Enter a QLD Lot/Plan; download GeoTIFF, interactive vectors, or clickable KMZ for Google Earth.",
-    version="2.0.0",
+    description="Enter a QLD Lot/Plan; download GeoTIFF, clickable KMZ, or both. Single or bulk from one box.",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -132,13 +132,13 @@ def _render_one_kmz_and_meta(lotplan: str, simplify_tolerance: float = 0.0) -> T
     }
     return kmz_bytes, meta
 
-# ---------------- UI (adds format, filename, bulk UI still present) ----------------
+# ---------------------- Unified UI (single input for single+bulk) ----------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html>
 <html lang="en"><head>
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>QLD Land Types → GeoTIFF + Map + KMZ</title>
+  <title>QLD Land Types → GeoTIFF + KMZ (Unified)</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
   <style>
     :root { --bg:#0b1220; --card:#121a2b; --text:#e8eefc; --muted:#9fb2d8; --accent:#6aa6ff; }
@@ -153,64 +153,93 @@ def home():
     .note{margin-top:8px;font-size:13px;color:#89a3d6} #map{height:520px;border-radius:14px;margin-top:14px;border:1px solid #203055}
     .out{margin-top:12px;border-top:1px solid #203055;padding-top:10px;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;white-space:pre-wrap}
     .badge{display:inline-block;padding:.2rem .5rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px;margin-left:8px}
+    .chip{display:inline-flex;align-items:center;gap:6px;padding:.2rem .6rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px;margin-left:8px}
+    .muted{color:#9fb2d8}
   </style>
 </head><body>
   <div class="wrap"><div class="card">
-    <h1>QLD Land Types → GeoTIFF + Map + KMZ <span class="badge">EPSG:4326</span></h1>
-    <p>Enter a Queensland <strong>Lot / Plan</strong> (e.g. <code>13DP1246224</code> or <code>13SP181800</code>). Download a GeoTIFF, load interactive polygons, or download a KMZ with clickable attributes for Google Earth.</p>
+    <h1>QLD Land Types <span class="badge">EPSG:4326</span> <span id="mode" class="chip">Mode: Single</span></h1>
+    <p>Paste one or many <strong>Lot / Plan</strong> codes. We auto-detect single vs bulk (ZIP) and use your chosen format.</p>
+
     <div class="row">
-      <div><label for="lotplan">Lot / Plan</label><input id="lotplan" type="text" placeholder="e.g. 13DP1246224" autocomplete="off" /></div>
-      <div><label for="maxpx">Max raster dimension (px) for GeoTIFF</label><input id="maxpx" type="number" min="256" max="8192" value="4096" /></div>
-      <div><label for="filename">Custom file name (optional, no extension)</label><input id="filename" type="text" placeholder="e.g. UpperCoomera_13SP181800" /></div>
-      <div><label for="fmt">Export format</label>
+      <div style="flex: 2 1 420px;">
+        <label for="items">Lot / Plan (single OR multiple — new line, comma, or semicolon separated)</label>
+        <textarea id="items" placeholder="13SP181800
+1RP12345
+2RP54321"></textarea>
+        <div class="muted" id="parseinfo">Detected 0 items.</div>
+      </div>
+      <div>
+        <label for="fmt">Export format</label>
         <select id="fmt">
           <option value="tiff" selected>GeoTIFF</option>
           <option value="kmz">KMZ (clickable)</option>
           <option value="both">Both (ZIP)</option>
         </select>
+
+        <label for="name">Name (single) or Prefix (bulk)</label>
+        <input id="name" type="text" placeholder="e.g. UpperCoomera_13SP181800 or Job_4021" />
+
+        <label for="maxpx">Max raster dimension (px) for GeoTIFF</label>
+        <input id="maxpx" type="number" min="256" max="8192" value="4096" />
+
+        <label for="simp">KMZ simplify tolerance (deg) <span class="muted">(try 0.00005 ≈ 5 m)</span></label>
+        <input id="simp" type="number" step="0.00001" min="0" max="0.001" value="0" />
       </div>
     </div>
 
     <div class="btns">
-      <button class="primary" id="btn-export-any">Export (single)</button>
-      <a class="ghost" id="btn-json" href="#">View JSON summary</a>
-      <a class="ghost" id="btn-load" href="#">Load on Map</a>
+      <button class="primary" id="btn-export">Export</button>
+      <a class="ghost" id="btn-json" href="#">Preview JSON (single)</a>
+      <a class="ghost" id="btn-load" href="#">Load on Map (single)</a>
     </div>
 
-    <div class="row" style="margin-top:18px">
-      <div><label for="bulk">Bulk Lot/Plan list (one per line, commas/semicolons also OK)</label>
-        <textarea id="bulk" placeholder="13SP181800
-1RP12345
-2RP54321"></textarea>
-      </div>
-      <div><label for="prefix">Filename prefix for ZIP contents (optional)</label><input id="prefix" type="text" placeholder="e.g. Job_4021" /></div>
-      <div><label for="simp">KMZ simplify tolerance (deg)</label><input id="simp" type="number" step="0.00001" min="0" max="0.001" value="0" /></div>
-    </div>
-
-    <div class="btns">
-      <button class="primary" id="btn-bulk-any">Bulk Export (ZIP)</button>
-    </div>
-
-    <div class="note">Input is normalised to UPPERCASE. Try <code>13SP181800</code>. API docs: <a href="/docs">/docs</a></div>
+    <div class="note">API docs: <a href="/docs">/docs</a>.  JSON/Map actions are enabled only when exactly one code is provided.</div>
     <div id="map"></div><div id="out" class="out"></div>
   </div></div>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <script>
-    const $lot = document.getElementById('lotplan'), $max = document.getElementById('maxpx'),
-          $out = document.getElementById('out'), $fn = document.getElementById('filename'),
-          $bulk = document.getElementById('bulk'), $prefix = document.getElementById('prefix'),
-          $btnBulkAny = document.getElementById('btn-bulk-any'), $btnExportAny = document.getElementById('btn-export-any'),
-          $btnJs = document.getElementById('btn-json'), $btnLoad = document.getElementById('btn-load'),
-          $fmt = document.getElementById('fmt'), $simp = document.getElementById('simp');
+    const $items = document.getElementById('items'), $fmt = document.getElementById('fmt'),
+          $name = document.getElementById('name'), $max = document.getElementById('maxpx'),
+          $simp = document.getElementById('simp'), $mode = document.getElementById('mode'),
+          $out = document.getElementById('out'), $parseinfo = document.getElementById('parseinfo'),
+          $btnExport = document.getElementById('btn-export'), $btnJson = document.getElementById('btn-json'),
+          $btnLoad = document.getElementById('btn-load');
 
-    function normLot(s){ return (s || '').trim().toUpperCase(); }
     function normText(s){ return (s || '').trim(); }
-    function parseBulk(text){
+    function normLot(s){ return (s || '').trim().toUpperCase(); }
+    function parseItems(text){
       const raw = (text || '').split(/\\r?\\n|,|;/);
       const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
       const seen = new Set(); const out = [];
       for(const v of clean){ if(!seen.has(v)){ seen.add(v); out.push(v); } }
       return out;
+    }
+
+    // Map init
+    const map = L.map('map', { zoomControl: true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+    map.setView([-23.5, 146.0], 5);
+    let parcelLayer=null, ltLayer=null;
+    function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
+    function clearLayers(){ if(parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }
+
+    function updateMode(){
+      const items = parseItems($items.value);
+      const n = items.length;
+      const dupInfo = (normText($items.value) && n === 0) ? " (duplicates/invalid removed)" : "";
+      $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.` + dupInfo;
+
+      if (n === 1){
+        $mode.textContent = "Mode: Single";
+        $btnJson.classList.remove('disabled'); $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
+        $btnLoad.classList.remove('disabled'); $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
+      } else {
+        $mode.textContent = `Mode: Bulk (${n})`;
+        $btnJson.classList.add('disabled'); $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
+        $btnLoad.classList.add('disabled'); $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
+      }
     }
 
     async function downloadBlobAs(res, filename){
@@ -222,19 +251,16 @@ def home():
       URL.revokeObjectURL(url);
     }
 
-    // Map & JSON helpers (unchanged)
-    const map = L.map('map', { zoomControl: true });
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
-    map.setView([-23.5, 146.0], 5);
-    let parcelLayer=null, ltLayer=null;
-    function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
-    function clearLayers(){ if(parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }
-    function mkVectorUrl(){ const lotplan = encodeURIComponent(normLot($lot.value)); return `/vector?lotplan=${lotplan}`; }
+    // Vector preview (single only)
+    function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
+
     async function loadVector(){
-      const lot = normLot($lot.value); if(!lot){ $out.textContent = 'Enter a Lot/Plan first.'; return; }
+      const items = parseItems($items.value);
+      if (items.length !== 1){ $out.textContent = 'Provide exactly one Lot/Plan to load map.'; return; }
+      const lot = items[0];
       $out.textContent = 'Loading vector data…';
       try{
-        const res = await fetch(mkVectorUrl()); const data = await res.json();
+        const res = await fetch(mkVectorUrl(lot)); const data = await res.json();
         if (data.error){ $out.textContent = 'Error: ' + data.error; return; }
         clearLayers();
         parcelLayer = L.geoJSON(data.parcel, { style: { color: '#ffcc00', weight:2, fillOpacity:0 } }).addTo(map);
@@ -249,70 +275,60 @@ def home():
       }catch(err){ $out.textContent = 'Network error: ' + err; }
     }
 
-    $btnLoad.addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
-
-    $btnJs.addEventListener('click', async (e)=>{
-      e.preventDefault();
-      const lot = normLot($lot.value); if(!lot){ $out.textContent='Enter a Lot/Plan first.'; return; }
+    // JSON preview (single only)
+    async function previewJson(){
+      const items = parseItems($items.value);
+      if (items.length !== 1){ $out.textContent = 'Provide exactly one Lot/Plan for JSON preview.'; return; }
+      const lot = items[0];
       $out.textContent='Requesting JSON summary…';
       try{
         const url = `/export?lotplan=${encodeURIComponent(lot)}&max_px=${encodeURIComponent(($max.value || '4096').trim())}&download=false`;
         const res = await fetch(url); const txt = await res.text();
         try{ const data = JSON.parse(txt); $out.textContent = JSON.stringify(data, null, 2);}catch{ $out.textContent = `Error ${res.status}: ${txt}`; }
       }catch(err){ $out.textContent = 'Network error: ' + err; }
-    });
+    }
 
-    // Unified single export → POST /export/any
-    $btnExportAny.addEventListener('click', async (e)=>{
-      e.preventDefault();
-      const lot = normLot($lot.value);
-      if(!lot){ $out.textContent='Enter a Lot/Plan first.'; return; }
-      const body = {
-        lotplan: lot,
-        format: $fmt.value,
-        max_px: parseInt($max.value || '4096', 10),
-        filename: normText($fn.value) || null,
-        simplify_tolerance: parseFloat($simp.value || '0') || 0
-      };
-      $out.textContent = 'Exporting…';
+    // Unified Export handler (single or bulk)
+    async function exportAny(){
+      const items = parseItems($items.value);
+      if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan.'; return; }
+      const fmt = $fmt.value;
+      const max_px = parseInt($max.value || '4096', 10);
+      const simp = parseFloat($simp.value || '0') || 0;
+      const name = normText($name.value) || null;
+
+      const body = { format: fmt, max_px: max_px, simplify_tolerance: simp };
+      if (items.length === 1){
+        body.lotplan = items[0];
+        if (name) body.filename = name;
+      } else {
+        body.lotplans = items;
+        if (name) body.filename_prefix = name;
+      }
+
+      $out.textContent = items.length === 1 ? 'Exporting…' : `Exporting ${items.length} items…`;
       try{
         const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         if (!res.ok){ const txt = await res.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
+
         const disp = res.headers.get('content-disposition') || '';
         const m = /filename="([^"]+)"/i.exec(disp);
-        const dl = m ? m[1] : `export_${Date.now()}`;
+        let dl = m ? m[1] : `export_${Date.now()}`;
+        // If bulk and name provided as prefix, ensure filename begins with it
+        if (items.length > 1 && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
         await downloadBlobAs(res, dl);
         $out.textContent = 'Download complete.';
       }catch(err){ $out.textContent = 'Network error: ' + err; }
-    });
+    }
 
-    // Unified bulk export → POST /export/any
-    $btnBulkAny.addEventListener('click', async (e)=>{
-      e.preventDefault();
-      const items = parseBulk($bulk.value);
-      if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan in the bulk box.'; return; }
-      const body = {
-        lotplans: items,
-        format: $fmt.value,
-        max_px: parseInt($max.value || '4096', 10),
-        filename_prefix: normText($prefix.value) || null,
-        simplify_tolerance: parseFloat($simp.value || '0') || 0
-      };
-      $out.textContent = `Submitting ${items.length} lot/plan codes…`;
-      try{
-        const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-        if (!res.ok){ const txt = await res.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
-        const disp = res.headers.get('content-disposition') || '';
-        const m = /filename="([^"]+)"/i.exec(disp);
-        const stamp = new Date().toISOString().replace(/[-:]/g,'').slice(0,15)+'Z';
-        const base = (normText($prefix.value) ? normText($prefix.value)+'_' : '');
-        const dl = m ? m[1] : `${base}landtypes_bulk_${stamp}.zip`;
-        await downloadBlobAs(res, dl);
-        $out.textContent = 'ZIP downloaded.';
-      }catch(err){ $out.textContent = 'Network error: ' + err; }
-    });
+    // Wire UI
+    $items.addEventListener('input', updateMode);
+    $btnLoad.addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
+    $btnJson.addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
+    $btnExport.addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
 
-    setTimeout(()=>{ $lot.focus(); }, 50);
+    updateMode();
+    setTimeout(()=>{ $items.focus(); }, 50);
   </script>
 </body></html>"""
 
@@ -320,7 +336,7 @@ def home():
 def health():
     return {"ok": True}
 
-# -------- Existing single endpoints (keep for compatibility) --------
+# ---------------------- Existing single endpoints (kept) ----------------------
 @app.get("/export")
 def export_geotiff(
     lotplan: str = Query(..., description="QLD Lot/Plan, e.g. 13DP1246224 or 13SP181800"),
@@ -392,7 +408,7 @@ def vector_geojson(lotplan: str = Query(..., description="QLD Lot/Plan")):
             "parcel": parcel_fc,
             "landtypes": { "type":"FeatureCollection", "features": features },
             "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
-            "bounds4326": {"west": west, "south": south, "east": east, "north": north}
+            "bounds4326": {"west": west, "south": south, "east": north, "north": north}
         })
     except Exception as e:
         logging.exception("Vector export error")
@@ -422,7 +438,7 @@ def export_kmz(
         logging.exception("KMZ export error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------- Original bulk TIFF endpoint (kept) --------
+# ---------------------- Original bulk TIFF endpoint (kept) ----------------------
 class BulkRequest(BaseModel):
     lotplans: List[str] = Field(..., description="List of QLD Lot/Plan codes")
     max_px: int = Field(4096, ge=256, le=8192)
@@ -486,7 +502,7 @@ def export_bulk(payload: BulkRequest = Body(...)):
     headers = {"Content-Disposition": f'attachment; filename="{dl_name}"'}
     return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
-# -------- NEW: unified single/bulk (TIFF, KMZ, or BOTH) --------
+# ---------------------- Unified single/bulk endpoint ----------------------
 class ExportAnyRequest(BaseModel):
     lotplan: Optional[str] = Field(None, description="Single QLD Lot/Plan")
     lotplans: Optional[List[str]] = Field(None, description="Multiple QLD Lot/Plan codes")
@@ -572,7 +588,6 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                     row.update({
                         "status_kmz": "ok",
                         "file_kmz": name,
-                        # If TIFF already populated bounds/area, keep; else use from KMZ meta
                         "bounds_epsg4326": row.get("bounds_epsg4326", meta2.get("bounds_epsg4326")),
                         "area_ha_total": row.get("area_ha_total", meta2.get("area_ha_total")),
                     })
