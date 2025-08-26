@@ -1,8 +1,8 @@
-fastapi==0.112.1
-uvicorn[standard]==0.30.5
-requests==2.32.3
-shapely==2.0.5
-pyproj==3.6.1
-rasterio==1.3.10
-numpy==2.0.1
-Pillow==10.4.0
+fastapi
+uvicorn
+pydantic
+requests
+shapely
+pyproj
+rasterio
+numpy
