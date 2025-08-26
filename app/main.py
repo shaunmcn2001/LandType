@@ -257,8 +257,11 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
     if download:
         data = open(out_path, "rb").read()
         os.remove(out_path); os.rmdir(tmpdir)
-        return StreamingResponse(BytesIO(data), media_type="image/tiff",
-                                 headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.tif"'})
+        return StreamingResponse(
+            BytesIO(data),
+            media_type="image/tiff",
+            headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.tif"'},
+        )
     else:
         public = {k:v for k,v in result.items() if k != "path"}
         legend = {}
@@ -328,8 +331,11 @@ def export_kmz(lotplan: str = Query(...), simplify_tolerance: float = Query(0.0,
     write_kmz(kml, out_path)
     data = open(out_path, "rb").read()
     os.remove(out_path); os.rmdir(tmpdir)
-    return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz",
-                             headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.kmz"'})
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.google-earth.kmz",
+        headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.kmz"'},
+    )
 
 class FormatEnum(str, Enum):
     tiff = "tiff"
@@ -389,8 +395,11 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
             fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not fname.lower().endswith(".tif"): fname += ".tif"
-            return StreamingResponse(BytesIO(data), media_type="image/tiff",
-                                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+            return StreamingResponse(
+                BytesIO(data),
+                media_type="image/tiff",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            )
         elif payload.format == FormatEnum.kmz:
             parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
             thematic_fc = fetch_landtypes_intersecting_envelope(env)
@@ -407,8 +416,11 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             write_kmz(kml, out_path); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
             fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not fname.lower().endswith(".kmz"): fname += ".kmz"
-            return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz",
-                                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+            return StreamingResponse(
+                BytesIO(data),
+                media_type="application/vnd.google-earth.kmz",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            )
         else:
             raise HTTPException(status_code=400, detail="Unsupported format.")
 
@@ -510,5 +522,8 @@ def export_any(payload: ExportAnyRequest = Body(...)):
     zip_buf.seek(0)
     stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     base = f"{prefix+'_' if prefix else ''}export_bundle"
-    return StreamingResponse(zip_buf, media_type="application/zip",
-                             headers={"Content-Disposition": f'attachment; filename="{base}_{stamp}.zip"'})
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{base}_{stamp}.zip"'},
+    )
