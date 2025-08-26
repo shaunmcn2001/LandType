@@ -4,7 +4,7 @@ from io import BytesIO
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query, Body, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Body, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types (rewritten)",
     description="Unified single/bulk exporter for Land Types + optional Vegetation (GeoTIFF, KMZ).",
-    version="3.0.1",
+    version="3.0.2",
 )
 
 app.add_middleware(
@@ -134,7 +134,7 @@ const $items = document.getElementById('items'), $fmt = document.getElementById(
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
-  const raw = (text || '').split(/\\r?\\n|,|;/);
+  const raw = (text || '').split(/\r?\n|,|;/);
   const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
   const seen = new Set(); const out = [];
   for(const v of clean){ if(!seen.has(v)){ seen.add(v); out.push(v); } }
@@ -236,7 +236,7 @@ document.getElementById('btn-export').addEventListener('click', (e)=>{ e.prevent
 updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
 </body></html>""".replace("%VEG_URL%", VEG_SERVICE_URL_DEFAULT).replace("%VEG_LAYER%", str(VEG_LAYER_ID_DEFAULT)).replace("%VEG_NAME%", VEG_NAME_FIELD_DEFAULT).replace("%VEG_CODE%", VEG_CODE_FIELD_DEFAULT or "")
-    
+
 @app.get("/health")
 def health(): return {"ok": True}
 
@@ -248,7 +248,7 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
     env = bbox_3857(parcel_union)
     lt_fc = fetch_landtypes_intersecting_envelope(env)
     clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-    if not clipped: 
+    if not clipped:
         if download: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
         return JSONResponse({"lotplan": lotplan, "error": "No Land Types intersect this parcel."}, status_code=404)
     tmpdir = tempfile.mkdtemp(prefix="tiff_")
@@ -257,7 +257,8 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
     if download:
         data = open(out_path, "rb").read()
         os.remove(out_path); os.rmdir(tmpdir)
-        return StreamingResponse(BytesIO(data), media_type="image/tiff", headers={"Content-Disposition": f'attachment; filename=\"{lotplan}_landtypes.tif\""})
+        return StreamingResponse(BytesIO(data), media_type="image/tiff",
+                                 headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.tif"'})
     else:
         public = {k:v for k,v in result.items() if k != "path"}
         legend = {}
@@ -327,7 +328,8 @@ def export_kmz(lotplan: str = Query(...), simplify_tolerance: float = Query(0.0,
     write_kmz(kml, out_path)
     data = open(out_path, "rb").read()
     os.remove(out_path); os.rmdir(tmpdir)
-    return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz", headers={"Content-Disposition": f'attachment; filename=\"{lotplan}_landtypes.kmz\"'} )
+    return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz",
+                             headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.kmz"'})
 
 class FormatEnum(str, Enum):
     tiff = "tiff"
@@ -387,7 +389,8 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
             fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not fname.lower().endswith(".tif"): fname += ".tif"
-            return StreamingResponse(BytesIO(data), media_type="image/tiff", headers={"Content-Disposition": f'attachment; filename=\"{fname}\"'})
+            return StreamingResponse(BytesIO(data), media_type="image/tiff",
+                                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
         elif payload.format == FormatEnum.kmz:
             parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
             thematic_fc = fetch_landtypes_intersecting_envelope(env)
@@ -404,7 +407,8 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             write_kmz(kml, out_path); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
             fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not fname.lower().endswith(".kmz"): fname += ".kmz"
-            return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz", headers={"Content-Disposition": f'attachment; filename=\"{fname}\"'})
+            return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz",
+                                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
         else:
             raise HTTPException(status_code=400, detail="Unsupported format.")
 
@@ -506,4 +510,5 @@ def export_any(payload: ExportAnyRequest = Body(...)):
     zip_buf.seek(0)
     stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     base = f"{prefix+'_' if prefix else ''}export_bundle"
-    return StreamingResponse(zip_buf, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename=\"{base}_{stamp}.zip\""})
+    return StreamingResponse(zip_buf, media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{base}_{stamp}.zip"'})
