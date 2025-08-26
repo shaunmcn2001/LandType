@@ -29,7 +29,7 @@ from .config import (
     VEG_SERVICE_URL_DEFAULT,
 )
 from .geometry import bbox_3857, prepare_clipped_shapes, to_shapely_union
-from .kml import build_kml, build_kml_folders, write_kmz
+from .kml import build_kml, build_kml_folders, build_kml_nested_folders, write_kmz
 from .raster import make_geotiff_rgba
 
 logging.basicConfig(level=logging.INFO)
@@ -352,7 +352,9 @@ def export_kmz(
             code = str(props.get(veg_code_field or "code") or props.get("code") or "").strip()
             name = str(props.get(veg_name_field or "name") or props.get("name") or code).strip()
             props["code"] = code or name or "UNK"
-            props["name"] = name or code or "Unknown"
+            # Format vegetation names as "Category *"
+            category_name = name or code or "Unknown"
+            props["name"] = f"Category {category_name}"
         veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
 
     if simplify_tolerance and simplify_tolerance > 0:
@@ -419,7 +421,9 @@ def export_kml(
             code = str(props.get(veg_code_field or "code") or props.get("code") or "").strip()
             name = str(props.get(veg_name_field or "name") or props.get("name") or code).strip()
             props["code"] = code or name or "UNK"
-            props["name"] = name or code or "Unknown"
+            # Format vegetation names as "Category *"
+            category_name = name or code or "Unknown"
+            props["name"] = f"Category {category_name}"
         veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
 
     if simplify_tolerance and simplify_tolerance > 0:
@@ -476,7 +480,7 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
                      veg_url: str, veg_layer: int, veg_name: str, veg_code: Optional[str]):
     """Create a single KMZ file containing folders for each lot/plan with nested land types and vegetation."""
     
-    all_folders = []
+    nested_groups = []
     
     for lp in items:
         try:
@@ -497,7 +501,9 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
                     code = str(props.get(veg_code or "code") or props.get("code") or "").strip()
                     name = str(props.get(veg_name or "name") or props.get("name") or code).strip()
                     props["code"] = code or name or "UNK"
-                    props["name"] = name or code or "Unknown"
+                    # Format vegetation names as "Category *"
+                    category_name = name or code or "Unknown"
+                    props["name"] = f"Category {category_name}"
                 veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
             
             # Apply simplification if requested
@@ -513,25 +519,29 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
                 if veg_clipped:
                     veg_clipped = _simp(veg_clipped)
             
-            # Add folders for this lot/plan
+            # Create nested structure: lot folder with land types and veg subfolders
+            subfolders = []
             if lt_clipped:
-                all_folders.append((lt_clipped, color_from_code, f"{lp} – Land Types"))
+                subfolders.append((lt_clipped, color_from_code, "Land Types"))
             if veg_clipped:
-                all_folders.append((veg_clipped, color_from_code, f"{lp} – Vegetation"))
+                subfolders.append((veg_clipped, color_from_code, "Veg"))
+            
+            if subfolders:
+                nested_groups.append((lp, subfolders))
                 
         except Exception:
             # Skip lots that fail to process
             continue
     
-    if not all_folders:
+    if not nested_groups:
         raise HTTPException(status_code=404, detail="No data found for any of the provided lot/plans.")
     
-    # Create KML with all folders
+    # Create KML with nested folder structure
     doc_name = f"QLD Bulk Export – {len(items)} lots"
     if prefix:
         doc_name = f"{prefix} – {doc_name}"
         
-    kml = build_kml_folders(all_folders, doc_name=doc_name)
+    kml = build_kml_nested_folders(nested_groups, doc_name=doc_name)
     
     # Create KMZ file
     tmpdir = tempfile.mkdtemp(prefix="bulk_kmz_")
@@ -611,7 +621,9 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                     code = str(props.get(veg_code or "code") or props.get("code") or "").strip()
                     name = str(props.get(veg_name or "name") or props.get("name") or code).strip()
                     props["code"] = code or name or "UNK"
-                    props["name"] = name or code or "Unknown"
+                    # Format vegetation names as "Category *"
+                    category_name = name or code or "Unknown"
+                    props["name"] = f"Category {category_name}"
                 veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
                 
             if payload.simplify_tolerance and payload.simplify_tolerance > 0:
@@ -697,7 +709,10 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                     p = f.get("properties") or {}
                     code = (p.get(veg_code) if veg_code else "") or (p.get(veg_name) or "UNK")
                     name = p.get(veg_name) or code
-                    p["code"] = str(code); p["name"] = str(name)
+                    p["code"] = str(code)
+                    # Format vegetation names as "Category *"
+                    category_name = str(name)
+                    p["name"] = f"Category {category_name}"
                     f["properties"] = p
                 veg_fc["features"] = feats
                 vclipped = prepare_clipped_shapes(parcel_fc, veg_fc)
