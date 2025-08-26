@@ -257,7 +257,7 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
   <div id="map"></div><div id="out" class="out"></div>
 </div></div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="" defer></script>
 <script>
 const $items = document.getElementById('items'), $fmt = document.getElementById('fmt'),
       $name = document.getElementById('name'), $max = document.getElementById('maxpx'),
@@ -274,49 +274,53 @@ function parseItems(text){
   const raw = (text || '').split(/\r?\n|,|;/);
   const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
   const seen = new Set(); const out = [];
-  for(const v of clean){ if(!seen.has(v)){ seen.add(v); out.push(v); } }
+  for (const v of clean){ if (!seen.has(v)) { seen.add(v); out.push(v); } }
   return out;
 }
 
-// Map
-const map = L.map('map', { zoomControl: true });
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
-map.setView([-23.5, 146.0], 5);
-let parcelLayer=null, ltLayer=null;
-function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
-function clearLayers(){ if(parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }
-
 function updateMode(){
-  const items = parseItems($items.value);
-  const n = items.length;
-  const dupInfo = (normText($items.value) && n === 0) ? " (duplicates/invalid removed)" : "";
-  $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.` + dupInfo;
+  try{
+    const items = parseItems($items.value);
+    const n = items.length;
+    const dupInfo = (normText($items.value) && n === 0) ? " (duplicates/invalid removed)" : "";
+    $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.` + dupInfo;
 
-  if (n === 1){
-    $mode.textContent = "Mode: Single";
-    $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
-    $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
-  } else {
-    $mode.textContent = `Mode: Bulk (${n})`;
-    $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
-    $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
+    if (n === 1){
+      $mode.textContent = "Mode: Single";
+      $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
+      $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
+    } else {
+      $mode.textContent = `Mode: Bulk (${n})`;
+      $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
+      $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
+    }
+  }catch(e){
+    console.warn("updateMode failed:", e);
   }
 }
 
-async function downloadBlobAs(res, filename){
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+// ---- Map (lazy + guarded) ----
+let map=null, parcelLayer=null, ltLayer=null;
+
+function ensureMap(){
+  try{
+    if (map || !document.getElementById('map')) return;
+    if (!window.L) { console.warn('Leaflet not loaded yet; map will init on demand.'); return; }
+    map = L.map('map', { zoomControl: true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
+    map.setView([-23.5, 146.0], 5);
+  }catch(e){ console.warn('Map init failed:', e); }
 }
+
+function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
+function clearLayers(){ try{ if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }catch{} }
 
 function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
 
 async function loadVector(){
   const items = parseItems($items.value);
   if (items.length !== 1){ $out.textContent = 'Provide exactly one Lot/Plan to load map.'; return; }
+  ensureMap(); if (!map){ $out.textContent = 'Map library not loaded yet. Try again in a moment.'; return; }
   const lot = items[0];
   $out.textContent = 'Loading vector data…';
   try{
@@ -350,26 +354,20 @@ async function previewJson(){
 async function exportAny(){
   const items = parseItems($items.value);
   if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan.'; return; }
-  const fmt = $fmt.value;
-  const max_px = parseInt($max.value || '4096', 10);
-  const simp = parseFloat($simp.value || '0') || 0;
-  const name = normText($name.value) || null;
-
   const body = {
-    format: fmt, max_px: max_px, simplify_tolerance: simp,
-    include_veg_tiff: $vegT.checked, include_veg_kmz: $vegK.checked,
-    veg_service_url: normText($vegURL.value) || null,
-    veg_layer_id: $vegLayer.value ? parseInt($vegLayer.value, 10) : null,
-    veg_name_field: normText($vegName.value) || null,
-    veg_code_field: normText($vegCode.value) || null,
+    format: $fmt.value,
+    max_px: parseInt($max.value || '4096', 10),
+    simplify_tolerance: parseFloat($simp.value || '0') || 0,
+    include_veg_tiff: !!document.getElementById('veg_tiff')?.checked,
+    include_veg_kmz: !!document.getElementById('veg_kmz')?.checked,
+    veg_service_url: normText($vegURL?.value || ''),
+    veg_layer_id: $vegLayer?.value ? parseInt($vegLayer.value, 10) : null,
+    veg_name_field: normText($vegName?.value || ''),
+    veg_code_field: normText($vegCode?.value || ''),
   };
-  if (items.length === 1){
-    body.lotplan = items[0];
-    if (name) body.filename = name;
-  } else {
-    body.lotplans = items;
-    if (name) body.filename_prefix = name;
-  }
+  const name = normText($name.value) || null;
+  if (items.length === 1){ body.lotplan = items[0]; if (name) body.filename = name; }
+  else { body.lotplans = items; if (name) body.filename_prefix = name; }
 
   $out.textContent = items.length === 1 ? 'Exporting…' : `Exporting ${items.length} items…`;
   try{
@@ -379,16 +377,24 @@ async function exportAny(){
     const m = /filename="([^"]+)"/i.exec(disp);
     let dl = m ? m[1] : `export_${Date.now()}`;
     if (items.length > 1 && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
-    await downloadBlobAs(res, dl);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = dl; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     $out.textContent = 'Download complete.';
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
+// Bind listeners *before* any map work
 $items.addEventListener('input', updateMode);
+$items.addEventListener('keyup', updateMode);
+$items.addEventListener('change', updateMode);
 document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
 document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
 document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
-updateMode(); setTimeout(()=>{ $items.focus(); }, 50);
+
+// Initial UI pass
+updateMode();
+setTimeout(()=>{ $items.focus(); ensureMap(); }, 50);
 </script>
 </body></html>"""
     return HTMLResponse(html)
