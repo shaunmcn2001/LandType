@@ -50,12 +50,12 @@ def _geom_to_kml_polygons(geom) -> Iterable[str]:
         yield f"<Polygon><outerBoundaryIs><LinearRing><coordinates>{ext}</coordinates></LinearRing></outerBoundaryIs>{inner_xml}</Polygon>"
 
 def build_kml(clipped, color_fn: Callable[[str], Tuple[int,int,int]], folder_name: Optional[str] = None, **kwargs) -> str:
-    folder_label = html.escape(folder_name or "QLD Land Types")
+    folder_label = html.escape(folder_name or "Export")
     styles = {}
     for _geom, code, name, _area in clipped:
         if code in styles: continue
         rgb = color_fn(code)
-        styles[code] = _kml_color_abgr_with_alpha(rgb, alpha=160)
+        styles[code] = _kml_color_abgr_with_alpha(rgb, alpha=180)
 
     style_xml = []
     for code, kml_color in styles.items():
@@ -77,7 +77,6 @@ def build_kml(clipped, color_fn: Callable[[str], Tuple[int,int,int]], folder_nam
         if not polys:
             continue
         geom_xml = polys[0] if len(polys) == 1 else "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
-
         placemarks.append(
             f"<Placemark>"
             f"<name>{esc_name} ({html.escape(code)})</name>"
