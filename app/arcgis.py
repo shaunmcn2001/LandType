@@ -51,16 +51,27 @@ def _arcgis_geojson_query(service_url: str, layer_id: int, params: Dict[str, Any
         out_fc = {"type": "FeatureCollection", "features": []}
     return out_fc
 
-_LOTPLAN_RE = re.compile(r"^\s*(\d+)\s*([A-Z]+[A-Z0-9]+)\s*$", re.IGNORECASE)
+_LOTPLAN_RE = re.compile(r"^\s*(?:LOT\s*)?(\d+)\s*(?:PLAN\s*)?([A-Z]+[A-Z0-9]+)\s*$", re.IGNORECASE)
+
 def _parse_lotplan(lp: str):
-    if not lp: return None, None
-    m = _LOTPLAN_RE.match(lp.strip().upper())
-    if not m: return None, None
+    if not lp:
+        return None, None
+    m = _LOTPLAN_RE.match((lp or "").strip().upper())
+    if not m:
+        return None, None
     return m.group(1), m.group(2)
 
+def normalize_lotplan(lp: str) -> str:
+    """Return canonical LOT+PLAN string (e.g. '13SP181800')."""
+    lot, plan = _parse_lotplan(lp)
+    if lot and plan:
+        return f"{lot}{plan}"
+    return (lp or "").strip().upper()
+
 def fetch_parcel_geojson(lotplan: str) -> Dict[str, Any]:
-    lp = (lotplan or "").strip().upper()
-    if not lp: return {"type":"FeatureCollection","features":[]}
+    lp = normalize_lotplan(lotplan)
+    if not lp:
+        return {"type":"FeatureCollection","features":[]}
     if not PARCEL_SERVICE_URL or PARCEL_LAYER_ID < 0:
         raise RuntimeError("Parcel service not configured.")
     common = {"outFields":"*","outSR":4326}
