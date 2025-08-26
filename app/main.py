@@ -54,7 +54,19 @@ def home():
 <html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>QLD Land Types (rewritten)</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" crossorigin="" onerror="this.remove()"/>
+<style>
+/* Fallback map styles when Leaflet CSS fails to load */
+.map-fallback {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #1a2332 0%, #0e1526 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+}
+</style>
 <style>
 :root{--bg:#0b1220;--card:#121a2b;--text:#e8eefc;--muted:#9fb2d8;--accent:#6aa6ff}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif}
@@ -64,7 +76,7 @@ input[type=text],input[type=number],textarea,select{width:100%;padding:10px 12px
 textarea{min-height:110px;resize:vertical}.row{display:flex;gap:12px;flex-wrap:wrap}.row>*{flex:1 1 200px}.btns{margin-top:12px;display:flex;gap:10px;flex-wrap:wrap}
 button,.ghost{appearance:none;border:0;border-radius:12px;padding:10px 14px;font-weight:600;cursor:pointer}
 button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent);text-decoration:none;border:1px solid #294a86;background:#0d1730}
-.note{margin-top:8px;font-size:13px;color:#89a3d6}#map{height:520px;border-radius:14px;margin-top:14px;border:1px solid #203055}
+.note{margin-top:8px;font-size:13px;color:#89a3d6}#map{height:520px;border-radius:14px;margin-top:14px;border:1px solid #203055;background:#0e1526;position:relative}
 .out{margin-top:12px;border-top:1px solid #203055;padding-top:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
 .badge{display:inline-block;padding:.2rem .5rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px;margin-left:8px}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:.2rem .6rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px}
@@ -123,10 +135,40 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
   </div>
 
   <div class="note">JSON/Map actions require exactly one lot/plan. API docs: <a href="/docs">/docs</a></div>
-  <div id="map"></div><div id="out" class="out"></div>
+  <div id="map">
+    <div id="map-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--muted);text-align:center;display:none;">
+      <div style="font-size:24px;margin-bottom:8px;">🗺️</div>
+      <div>Loading map...</div>
+    </div>
+    <div id="map-error" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--muted);text-align:center;display:none;">
+      <div style="font-size:24px;margin-bottom:8px;">⚠️</div>
+      <div>Map unavailable</div>
+      <div style="font-size:12px;margin-top:8px;opacity:0.7;">Map library failed to load from CDN</div>
+      <div style="font-size:12px;margin-top:4px;opacity:0.7;">Data can still be exported via other formats</div>
+    </div>
+  </div><div id="out" class="out"></div>
 </div></div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin="" defer onerror="window.leafletFailed=true"></script>
+<script>
+// Fallback map implementation when Leaflet fails to load
+window.createFallbackMap = function() {
+  const mapEl = document.getElementById('map');
+  if (!mapEl) return;
+  
+  mapEl.innerHTML = `
+    <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--muted);text-align:center;">
+      <div style="font-size:24px;margin-bottom:8px;">🌏</div>
+      <div>Interactive Map Unavailable</div>
+      <div style="font-size:12px;margin-top:8px;opacity:0.7;">External map library blocked</div>
+      <div style="font-size:12px;margin-top:4px;opacity:0.7;">Use Export/JSON functions for data access</div>
+      <div style="margin-top:16px;padding:8px 12px;background:rgba(106,166,255,0.1);border-radius:8px;border:1px solid rgba(106,166,255,0.3);">
+        <div style="font-size:11px;color:#6aa6ff;">💡 Tip: Try disabling ad blockers to enable the map</div>
+      </div>
+    </div>
+  `;
+}
+</script>
 <script>
 const $items = document.getElementById('items'), $fmt = document.getElementById('fmt'),
       $name = document.getElementById('name'), $max = document.getElementById('maxpx'),
@@ -166,14 +208,40 @@ function updateMode(){
 }
 
 let map=null, parcelLayer=null, ltLayer=null;
+function showMapLoading() {
+  const loading = document.getElementById('map-loading');
+  const error = document.getElementById('map-error');
+  if (loading) { loading.style.display = 'block'; }
+  if (error) { error.style.display = 'none'; }
+}
+function showMapError() {
+  const loading = document.getElementById('map-loading');
+  const error = document.getElementById('map-error');
+  if (loading) { loading.style.display = 'none'; }
+  if (error) { error.style.display = 'block'; }
+}
+function hideMapMessages() {
+  const loading = document.getElementById('map-loading');
+  const error = document.getElementById('map-error');
+  if (loading) { loading.style.display = 'none'; }
+  if (error) { error.style.display = 'none'; }
+}
 function ensureMap(){
   try{
     if (map) return;
-    if (!window.L) return;
+    if (!window.L) {
+      showMapError();
+      return;
+    }
+    showMapLoading();
     map = L.map('map', { zoomControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
     map.setView([-23.5, 146.0], 5);
-  }catch(e){ console.warn('Map init failed:', e); }
+    hideMapMessages();
+  }catch(e){ 
+    console.warn('Map init failed:', e); 
+    showMapError();
+  }
 }
 function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
 function clearLayers(){ try{ if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }catch{} }
@@ -247,7 +315,20 @@ $items.addEventListener('change', updateMode);
 document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
 document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
 document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
-updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
+updateMode(); 
+// Check for Leaflet availability and show appropriate map state
+setTimeout(()=>{ 
+  if (!window.L || window.leafletFailed) {
+    if (window.createFallbackMap) {
+      window.createFallbackMap();
+    } else {
+      showMapError();
+    }
+  } else {
+    ensureMap(); 
+  }
+  $items.focus(); 
+}, 200);
 </script>
 </body></html>"""
     
