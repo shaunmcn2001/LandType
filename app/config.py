@@ -1,29 +1,127 @@
-# app/config.py
-# Hard-coded service/layer/field settings for Queensland datasets
+# app/arcgis.py
+from __future__ import annotations
+import re, json, requests
+from typing import Dict, Any
+from .config import (
+    PARCEL_SERVICE_URL, PARCEL_LAYER_ID, PARCEL_LOTPLAN_FIELD, PARCEL_LOT_FIELD, PARCEL_PLAN_FIELD,
+    LANDTYPES_SERVICE_URL, LANDTYPES_LAYER_ID, LANDTYPES_CODE_FIELD, LANDTYPES_NAME_FIELD,
+    ARCGIS_TIMEOUT, ARCGIS_MAX_RECORDS,
+)
 
-# ── Parcels (DCDB)
-# Source: PlanningCadastre / LandParcelPropertyFramework → layer 4 "Cadastral parcels"
-# Fields include: lotplan, lot, plan
-PARCEL_SERVICE_URL = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer"
-PARCEL_LAYER_ID = 4
-PARCEL_LOTPLAN_FIELD = "lotplan"   # combined, e.g. 13SP181800
-PARCEL_LOT_FIELD = "lot"           # split fallback
-PARCEL_PLAN_FIELD = "plan"
+def _layer_query_url(service_url: str, layer_id: int) -> str:
+    return f"{service_url.rstrip('/')}/{int(layer_id)}/query"
 
-# ── Land Types (GLM)
-# Source: Environment / LandTypes → layer 1 "Land types"
-LANDTYPES_SERVICE_URL = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Environment/LandTypes/MapServer"
-LANDTYPES_LAYER_ID = 1
-LANDTYPES_CODE_FIELD = "lt_code_1"
-LANDTYPES_NAME_FIELD = "lt_name_1"
+def _ensure_fc(obj: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(obj, dict) or obj.get("type") != "FeatureCollection":
+        raise RuntimeError("ArcGIS did not return GeoJSON FeatureCollection")
+    obj.setdefault("features", [])
+    return obj
 
-# ── Vegetation (Regulated Vegetation Management)
-# Source: Biota / VegetationManagement → layer 109 "RVM - all"
-VEG_SERVICE_URL_DEFAULT = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer"
-VEG_LAYER_ID_DEFAULT = 109
-VEG_NAME_FIELD_DEFAULT = "rvm_cat"
-VEG_CODE_FIELD_DEFAULT = "rvm_cat"
+def _merge_fc(accum: Dict[str, Any], more: Dict[str, Any]) -> Dict[str, Any]:
+    if not accum:
+        return more
+    accum.setdefault("features", [])
+    accum["features"].extend(more.get("features", []))
+    return accum
 
-# ── HTTP / paging
-ARCGIS_TIMEOUT = 45          # seconds
-ARCGIS_MAX_RECORDS = 2000    # per page (server permits this on these layers)
+def _arcgis_geojson_query(service_url: str, layer_id: int, params: Dict[str, Any], paginate: bool = True) -> Dict[str, Any]:
+    url = _layer_query_url(service_url, layer_id)
+    base = {"f": "geojson", "returnGeometry": "true"}
+    base.update(params or {})
+    result_offset = int(base.pop("resultOffset", 0))
+    result_record_count = int(base.pop("resultRecordCount", ARCGIS_MAX_RECORDS))
+
+    sess = requests.Session()
+    out_fc: Dict[str, Any] = {}
+    while True:
+        q = dict(base)
+        q["resultOffset"] = result_offset
+        q["resultRecordCount"] = result_record_count
+        r = sess.get(url, params=q, timeout=ARCGIS_TIMEOUT)
+        r.raise_for_status()
+        fc = r.json()
+        _ensure_fc(fc)
+        out_fc = _merge_fc(out_fc, fc)
+        feats = fc.get("features", [])
+        if paginate and len(feats) >= result_record_count:
+            result_offset += result_record_count
+        else:
+            break
+    if not out_fc:
+        out_fc = {"type": "FeatureCollection", "features": []}
+    return out_fc
+
+_LOTPLAN_RE = re.compile(r"^\s*(\d+)\s*([A-Z]+[A-Z0-9]+)\s*$", re.IGNORECASE)
+def _parse_lotplan(lp: str):
+    if not lp: return None, None
+    m = _LOTPLAN_RE.match(lp.strip().upper())
+    if not m: return None, None
+    return m.group(1), m.group(2)
+
+def fetch_parcel_geojson(lotplan: str) -> Dict[str, Any]:
+    lp = (lotplan or "").strip().upper()
+    if not lp: return {"type":"FeatureCollection","features":[]}
+    if not PARCEL_SERVICE_URL or PARCEL_LAYER_ID < 0:
+        raise RuntimeError("Parcel service not configured.")
+    common = {"outFields":"*","outSR":4326}
+
+    # Combined LOTPLAN field first
+    if PARCEL_LOTPLAN_FIELD:
+        where = f"UPPER({PARCEL_LOTPLAN_FIELD})='{lp}'"
+        fc = _arcgis_geojson_query(PARCEL_SERVICE_URL, PARCEL_LAYER_ID, dict(common, where=where), paginate=False)
+        if fc.get("features"): return fc
+
+    # Split LOT + PLAN fallback
+    if PARCEL_LOT_FIELD and PARCEL_PLAN_FIELD:
+        lot, plan = _parse_lotplan(lp)
+        if lot and plan:
+            where = f"UPPER({PARCEL_LOT_FIELD})='{lot}' AND UPPER({PARCEL_PLAN_FIELD})='{plan}'"
+            fc = _arcgis_geojson_query(PARCEL_SERVICE_URL, PARCEL_LAYER_ID, dict(common, where=where), paginate=False)
+            if fc.get("features"): return fc
+
+    return {"type":"FeatureCollection","features":[]}
+
+def _standardise_code_name(fc: Dict[str, Any], code_field: str, name_field: str) -> Dict[str, Any]:
+    feats = fc.get("features", [])
+    out = []
+    for f in feats:
+        p = f.get("properties") or {}
+        code = str(p.get(code_field, "")).strip()
+        name = str(p.get(name_field, "")).strip()
+        if not code and name: code = name
+        if not name and code: name = code
+        p["code"] = code or "UNK"
+        p["name"] = name or (code or "Unknown")
+        out.append({"type":"Feature","geometry":f.get("geometry"),"properties":p})
+    return {"type":"FeatureCollection","features":out}
+
+def fetch_landtypes_intersecting_envelope(env_3857) -> Dict[str, Any]:
+    if not LANDTYPES_SERVICE_URL or LANDTYPES_LAYER_ID < 0:
+        raise RuntimeError("Land Types service not configured.")
+    xmin, ymin, xmax, ymax = env_3857
+    geometry = {"xmin": float(xmin),"ymin": float(ymin), "xmax": float(xmax),"ymax": float(ymax), "spatialReference":{"wkid":3857}}
+    params = {
+        "where": "1=1",
+        "geometry": json.dumps(geometry),
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 3857,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "*",
+        "outSR": 4326,
+    }
+    fc = _arcgis_geojson_query(LANDTYPES_SERVICE_URL, LANDTYPES_LAYER_ID, params, paginate=True)
+    return _standardise_code_name(fc, LANDTYPES_CODE_FIELD, LANDTYPES_NAME_FIELD)
+
+def fetch_features_intersecting_envelope(service_url: str, layer_id: int, env_3857, out_sr: int = 4326, out_fields: str = "*", where: str = "1=1") -> Dict[str, Any]:
+    xmin, ymin, xmax, ymax = env_3857
+    geometry = {"xmin": float(xmin),"ymin": float(ymin), "xmax": float(xmax),"ymax": float(ymax), "spatialReference":{"wkid":3857}}
+    params = {
+        "where": where or "1=1",
+        "geometry": json.dumps(geometry),
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 3857,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": out_fields or "*",
+        "outSR": out_sr,
+    }
+    return _arcgis_geojson_query(service_url, int(layer_id), params, paginate=True)
