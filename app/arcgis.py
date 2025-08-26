@@ -46,3 +46,40 @@ def fetch_landtypes_intersecting_envelope(envelope_3857: Tuple[float, float, flo
     if "features" not in data:
         raise RuntimeError("Unexpected Land Types query response.")
     return data
+    # app/arcgis.py
+import json, requests
+
+def fetch_features_intersecting_envelope(
+    service_url: str,
+    layer_id: int,
+    env_3857,
+    out_sr: int = 4326,
+    out_fields: str = "*",
+    where: str = "1=1",
+    timeout: int = 30
+):
+    xmin, ymin, xmax, ymax = env_3857
+    url = f"{service_url.rstrip('/')}/{int(layer_id)}/query"
+    geometry = {
+        "xmin": float(xmin), "ymin": float(ymin),
+        "xmax": float(xmax), "ymax": float(ymax),
+        "spatialReference": {"wkid": 3857}
+    }
+    params = {
+        "f": "geojson",
+        "where": where,
+        "geometry": json.dumps(geometry),
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 3857,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": out_fields,
+        "outSR": out_sr,
+        "returnGeometry": "true",
+    }
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    fc = r.json()
+    if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
+        raise RuntimeError(f"Unexpected response from {url}")
+    return fc
+
