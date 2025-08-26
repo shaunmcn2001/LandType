@@ -14,7 +14,7 @@ from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope,
 from .geometry import to_shapely_union, bbox_3857, prepare_clipped_shapes
 from .raster import make_geotiff_rgba
 from .colors import color_from_code
-from .kml import build_kml, write_kmz
+from .kml import build_kml, build_kml_folders, write_kmz
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
@@ -335,6 +335,70 @@ def export_kmz(lotplan: str = Query(...), simplify_tolerance: float = Query(0.0,
         BytesIO(data),
         media_type="application/vnd.google-earth.kmz",
         headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.kmz"'},
+    )
+
+@app.get("/export_kml")
+def export_kml(
+    lotplan: str = Query(...),
+    simplify_tolerance: float = Query(0.0, ge=0.0, le=0.001),
+    include_veg: bool = Query(False),
+    veg_service_url: Optional[str] = Query(VEG_SERVICE_URL_DEFAULT, alias="veg_url"),
+    veg_layer_id: Optional[int] = Query(VEG_LAYER_ID_DEFAULT, alias="veg_layer"),
+    veg_name_field: Optional[str] = Query(VEG_NAME_FIELD_DEFAULT, alias="veg_name"),
+    veg_code_field: Optional[str] = Query(VEG_CODE_FIELD_DEFAULT, alias="veg_code"),
+):
+    lotplan = lotplan.strip().upper()
+    parcel_fc = fetch_parcel_geojson(lotplan)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    lt_clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    if not lt_clipped:
+        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+
+    veg_clipped = []
+    if include_veg and veg_service_url and veg_layer_id is not None:
+        veg_fc = fetch_features_intersecting_envelope(
+            veg_service_url, veg_layer_id, env, out_fields="*"
+        )
+        # standardise fields
+        for f in veg_fc.get("features", []):
+            props = f.get("properties") or {}
+            code = str(props.get(veg_code_field or "code") or props.get("code") or "").strip()
+            name = str(props.get(veg_name_field or "name") or props.get("name") or code).strip()
+            props["code"] = code or name or "UNK"
+            props["name"] = name or code or "Unknown"
+        veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
+
+    if simplify_tolerance and simplify_tolerance > 0:
+        def _simp(data):
+            out = []
+            for geom4326, code, name, area_ha in data:
+                g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
+                if not g2.is_empty:
+                    out.append((g2, code, name, area_ha))
+            return out or data
+        lt_clipped = _simp(lt_clipped)
+        if veg_clipped:
+            veg_clipped = _simp(veg_clipped)
+
+    if veg_clipped:
+        kml = build_kml_folders(
+            [
+                (lt_clipped, color_from_code, f"Land Types – {lotplan}"),
+                (veg_clipped, color_from_code, f"Vegetation – {lotplan}"),
+            ],
+            doc_name=f"QLD Export – {lotplan}",
+        )
+    else:
+        kml = build_kml(lt_clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lotplan}")
+
+    filename = f"{lotplan}_landtypes" + ("_veg" if veg_clipped else "") + ".kml"
+    return Response(
+        content=kml,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 class FormatEnum(str, Enum):
