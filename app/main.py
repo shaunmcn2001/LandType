@@ -1,25 +1,36 @@
 # app/main.py
-import os, io, csv, zipfile, tempfile, logging, datetime as dt
-from io import BytesIO
+import csv
+import datetime as dt
+import io
+import logging
+import os
+import tempfile
+import zipfile
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from io import BytesIO
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Body, Response
+from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .config import VEG_SERVICE_URL_DEFAULT, VEG_LAYER_ID_DEFAULT, VEG_NAME_FIELD_DEFAULT, VEG_CODE_FIELD_DEFAULT
 from .arcgis import (
-    fetch_parcel_geojson,
-    fetch_landtypes_intersecting_envelope,
     fetch_features_intersecting_envelope,
+    fetch_landtypes_intersecting_envelope,
+    fetch_parcel_geojson,
     normalize_lotplan,
 )
-from .geometry import to_shapely_union, bbox_3857, prepare_clipped_shapes
-from .raster import make_geotiff_rgba
 from .colors import color_from_code
+from .config import (
+    VEG_CODE_FIELD_DEFAULT,
+    VEG_LAYER_ID_DEFAULT,
+    VEG_NAME_FIELD_DEFAULT,
+    VEG_SERVICE_URL_DEFAULT,
+)
+from .geometry import bbox_3857, prepare_clipped_shapes, to_shapely_union
 from .kml import build_kml, build_kml_folders, write_kmz
+from .raster import make_geotiff_rgba
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
@@ -508,7 +519,7 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
             if veg_clipped:
                 all_folders.append((veg_clipped, color_from_code, f"{lp} – Vegetation"))
                 
-        except Exception as e:
+        except Exception:
             # Skip lots that fail to process
             continue
     
@@ -658,7 +669,7 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                         _ = make_geotiff_rgba(clipped, path, max_px=payload.max_px)
                         zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif", open(path,"rb").read())
                         try: os.remove(path); os.rmdir(tmpdir)
-                        except: pass
+                        except Exception: pass
                         row["status_tiff"]="ok"; row["file_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
                     if payload.format in (FormatEnum.kmz, FormatEnum.both):
                         if payload.simplify_tolerance and payload.simplify_tolerance > 0:
@@ -696,7 +707,7 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                         _ = make_geotiff_rgba(vclipped, path, max_px=payload.max_px)
                         zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif", open(path,"rb").read())
                         try: os.remove(path); os.rmdir(tmpdir)
-                        except: pass
+                        except Exception: pass
                         row["status_veg_tiff"]="ok"; row["file_veg_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif"
                     if payload.include_veg_kmz:
                         kml = build_kml(vclipped, color_fn=color_from_code, folder_name=f"Vegetation – {lp}")
