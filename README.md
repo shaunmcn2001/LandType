@@ -21,4 +21,5 @@ Open http://localhost:8000
 - `/vector?lotplan=13SP181800` — Parcel + Land Types GeoJSON
 - `/export?lotplan=...&download=true` — Single Land Types GeoTIFF
 - `/export_kmz?lotplan=...` — Single Land Types KMZ
+- `/export_kml?lotplan=...&include_veg=true` — Land Types KML, optionally with Vegetation
 - `POST /export/any` — Single/bulk, with optional vegetation, emits ZIP when multiple/combined.
