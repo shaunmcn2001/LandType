@@ -120,6 +120,7 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
     <button class="primary" id="btn-export">Export</button>
     <a class="ghost" id="btn-json" href="#">Preview JSON (single)</a>
     <a class="ghost" id="btn-load" href="#">Load on Map (single)</a>
+    <button class="ghost" id="btn-load-predefined">Load Predefined</button>
   </div>
 
   <div class="note">JSON/Map actions require exactly one lot/plan. API docs: <a href="/docs">/docs</a></div>
@@ -133,7 +134,7 @@ const $items = document.getElementById('items'), $fmt = document.getElementById(
       $simp = document.getElementById('simp'), $mode = document.getElementById('mode'),
       $out = document.getElementById('out'), $parseinfo = document.getElementById('parseinfo'),
       $btnExport = document.getElementById('btn-export'), $btnJson = document.getElementById('btn-json'),
-      $btnLoad = document.getElementById('btn-load');
+      $btnLoad = document.getElementById('btn-load'), $btnLoadPredefined = document.getElementById('btn-load-predefined');
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
@@ -238,12 +239,25 @@ async function exportAny(){
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
+async function loadPredefined(){
+  $out.textContent = 'Loading predefined lot plans…';
+  try{
+    const res = await fetch('/lotplans');
+    if (!res.ok){ $out.textContent = `Error ${res.status}: Failed to load predefined lot plans`; return; }
+    const data = await res.json();
+    $items.value = data.lotplans || '';
+    updateMode();
+    $out.textContent = 'Predefined lot plans loaded successfully.';
+  }catch(err){ $out.textContent = 'Network error: ' + err; }
+}
+
 $items.addEventListener('input', updateMode);
 $items.addEventListener('keyup', updateMode);
 $items.addEventListener('change', updateMode);
 document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
 document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
 document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
+document.getElementById('btn-load-predefined').addEventListener('click', (e)=>{ e.preventDefault(); loadPredefined(); });
 updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
 </body></html>"""
@@ -253,6 +267,20 @@ updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 
 @app.get("/health")
 def health(): return {"ok": True}
+
+@app.get("/lotplans")
+def get_lotplans():
+    """Serve the predefined lot plans from lotplans.txt"""
+    try:
+        import os
+        lotplans_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "lotplans.txt")
+        with open(lotplans_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return {"lotplans": content}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="lotplans.txt file not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading lotplans.txt: {str(e)}")
 
 @app.get("/export")
 def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, le=8192), download: bool = Query(True)):
