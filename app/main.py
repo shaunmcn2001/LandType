@@ -10,7 +10,12 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import VEG_SERVICE_URL_DEFAULT, VEG_LAYER_ID_DEFAULT, VEG_NAME_FIELD_DEFAULT, VEG_CODE_FIELD_DEFAULT
-from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope, fetch_features_intersecting_envelope
+from .arcgis import (
+    fetch_parcel_geojson,
+    fetch_landtypes_intersecting_envelope,
+    fetch_features_intersecting_envelope,
+    normalize_lotplan,
+)
 from .geometry import to_shapely_union, bbox_3857, prepare_clipped_shapes
 from .raster import make_geotiff_rgba
 from .colors import color_from_code
@@ -134,10 +139,18 @@ const $items = document.getElementById('items'), $fmt = document.getElementById(
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
-  const raw = (text || '').split(/\r?\n|,|;/);
-  const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
+  const src = (text || '')
+    .toUpperCase()
+    .replace(/\bLOT\b/g,' ')
+    .replace(/\bPLAN\b/g,' ')
+    .replace(/\bON\b/g,' ')
+    .replace(/[^A-Z0-9]+/g,' ');
   const seen = new Set(); const out = [];
-  for(const v of clean){ if(!seen.has(v)){ seen.add(v); out.push(v); } }
+  const rx = /(\d+)\s*([A-Z]+[A-Z0-9]+)/g; let m;
+  while((m = rx.exec(src)) !== null){
+    const code = `${m[1]}${m[2]}`;
+    if(!seen.has(code)){ seen.add(code); out.push(code); }
+  }
   return out;
 }
 function updateMode(){
@@ -242,7 +255,7 @@ def health(): return {"ok": True}
 
 @app.get("/export")
 def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, le=8192), download: bool = Query(True)):
-    lotplan = lotplan.strip().upper()
+    lotplan = normalize_lotplan(lotplan)
     parcel_fc = fetch_parcel_geojson(lotplan)
     parcel_union = to_shapely_union(parcel_fc)
     env = bbox_3857(parcel_union)
@@ -273,7 +286,7 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
 
 @app.get("/vector")
 def vector_geojson(lotplan: str = Query(...)):
-    lotplan = lotplan.strip().upper()
+    lotplan = normalize_lotplan(lotplan)
     parcel_fc = fetch_parcel_geojson(lotplan)
     parcel_union = to_shapely_union(parcel_fc)
     env = bbox_3857(parcel_union)
@@ -310,7 +323,7 @@ def vector_geojson(lotplan: str = Query(...)):
 
 @app.get("/export_kmz")
 def export_kmz(lotplan: str = Query(...), simplify_tolerance: float = Query(0.0, ge=0.0, le=0.001)):
-    lotplan = lotplan.strip().upper()
+    lotplan = normalize_lotplan(lotplan)
     parcel_fc = fetch_parcel_geojson(lotplan)
     parcel_union = to_shapely_union(parcel_fc)
     env = bbox_3857(parcel_union)
@@ -347,7 +360,7 @@ def export_kml(
     veg_name_field: Optional[str] = Query(VEG_NAME_FIELD_DEFAULT, alias="veg_name"),
     veg_code_field: Optional[str] = Query(VEG_CODE_FIELD_DEFAULT, alias="veg_code"),
 ):
-    lotplan = lotplan.strip().upper()
+    lotplan = normalize_lotplan(lotplan)
     parcel_fc = fetch_parcel_geojson(lotplan)
     parcel_union = to_shapely_union(parcel_fc)
     env = bbox_3857(parcel_union)
@@ -426,12 +439,12 @@ def export_any(payload: ExportAnyRequest = Body(...)):
     items: List[str] = []
     if payload.lotplans:
         seen = set()
-        for lp in (lp.strip().upper() for lp in payload.lotplans):
+        for lp in (normalize_lotplan(lp) for lp in payload.lotplans):
             if not lp: continue
             if lp in seen: continue
             seen.add(lp); items.append(lp)
     if payload.lotplan:
-        lp = payload.lotplan.strip().upper()
+        lp = normalize_lotplan(payload.lotplan)
         if lp and lp not in items:
             items.append(lp)
     if not items: raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
