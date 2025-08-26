@@ -1,7 +1,7 @@
 # app/geometry.py
 from __future__ import annotations
 from typing import Dict, Any, Tuple, List
-from shapely.geometry import shape, mapping, GeometryCollection
+from shapely.geometry import shape, GeometryCollection
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 from pyproj import Transformer
@@ -69,8 +69,7 @@ def prepare_clipped_shapes(parcel_fc: Dict[str, Any], thematic_fc: Dict[str, Any
             except Exception:
                 continue
         if inter.is_empty: continue
-        area_ha = _area_ha(inter)
-        out.append((inter, code, name, float(area_ha)))
+        out.append((inter, code, name, float(_area_ha(inter))))
     # dissolve by code+name
     by_key = {}
     for g, c, n, a in out:
