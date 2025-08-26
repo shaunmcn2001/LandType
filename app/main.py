@@ -1,5 +1,5 @@
 # app/main.py
-import os, tempfile, logging, zipfile, csv, datetime as dt
+import os, tempfile, logging, zipfile, csv, datetime as dt, io
 from io import BytesIO
 from enum import Enum
 from typing import List, Optional, Dict, Any, Tuple
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="QLD Land Types → GeoTIFF + KMZ (Unified + Vegetation)",
     description="Single or bulk export from one box: Land Types & optional Vegetation (GeoTIFF/KMZ).",
-    version="2.8.0",
+    version="2.8.1",
 )
 
 app.add_middleware(
@@ -34,7 +34,10 @@ app.add_middleware(
 )
 
 # Vegetation defaults (env-overridable)
-VEG_SERVICE_URL_DEFAULT = os.getenv("VEG_SERVICE_URL", "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer").strip()
+VEG_SERVICE_URL_DEFAULT = os.getenv(
+    "VEG_SERVICE_URL",
+    "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer",
+).strip()
 VEG_LAYER_ID_DEFAULT = int(os.getenv("VEG_LAYER_ID", "109"))
 VEG_NAME_FIELD_DEFAULT = os.getenv("VEG_NAME_FIELD", "CLASS_NAME").strip()
 VEG_CODE_FIELD_DEFAULT = os.getenv("VEG_CODE_FIELD", "CLASS_CODE").strip() or None
@@ -57,6 +60,7 @@ def _require_parcel_fc(lotplan: str) -> Dict[str, Any]:
     return fc
 
 def _build_kml_compat(clipped, folder_label: str):
+    # Accepts older build_kml signatures (folder_name/doc_name/name)
     for kw in ("folder_name", "doc_name", "document_name", "name"):
         try:
             return build_kml(clipped, color_fn=color_from_code, **{kw: folder_label})
@@ -387,11 +391,6 @@ document.getElementById('btn-export').addEventListener('click', (e)=>{ e.prevent
 updateMode(); setTimeout(()=>{ $items.focus(); }, 50);
 </script>
 </body></html>"""
-    html = (html
-            .replace("https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer", VEG_SERVICE_URL_DEFAULT)
-            .replace("109", str(VEG_LAYER_ID_DEFAULT))
-            .replace("CLASS_NAME", VEG_NAME_FIELD_DEFAULT)
-            .replace("CLASS_CODE", "" if VEG_CODE_FIELD_DEFAULT is None else VEG_CODE_FIELD_DEFAULT))
     return HTMLResponse(html)
 
 @app.get("/health")
@@ -573,7 +572,7 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                 simplified = []
                 for geom4326, code, name, area_ha in clipped:
                     g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
-                    if not g2.is_empty: simplified.append((g2, code, name, a_ha))
+                    if not g2.is_empty: simplified.append((g2, code, name, area_ha))
                 clipped = simplified or clipped
             kml = _build_kml_compat(clipped, f"QLD Land Types – {lp}")
             tmpdir = tempfile.mkdtemp(prefix="kmz_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.kmz")
@@ -662,20 +661,25 @@ def export_any(payload: ExportAnyRequest = Body(...)):
 
             manifest_rows.append(row)
 
-        mem_csv = BytesIO()
-        import csv as _csv
-        fieldnames = [
+        # CSV manifest (text mode → bytes for zip)
+        mem_csv = io.StringIO(newline='')
+        writer = csv.DictWriter(mem_csv, fieldnames=[
             "lotplan",
             "status_tiff","file_tiff","tiff_message",
             "status_kmz","file_kmz","kmz_message",
             "status_veg_tiff","file_veg_tiff","veg_tiff_message",
             "status_veg_kmz","file_veg_kmz","veg_kmz_message",
-        ]
-        writer = _csv.DictWriter(mem_csv, fieldnames=fieldnames); writer.writeheader()
+        ])
+        writer.writeheader()
         for row in manifest_rows:
-            for k in fieldnames: row.setdefault(k, "")
-            writer.writerow(row)
-        zf.writestr("manifest.csv", mem_csv.getvalue())
+            writer.writerow({
+                "lotplan": row.get("lotplan",""),
+                "status_tiff": row.get("status_tiff",""), "file_tiff": row.get("file_tiff",""), "tiff_message": row.get("tiff_message",""),
+                "status_kmz": row.get("status_kmz",""), "file_kmz": row.get("file_kmz",""), "kmz_message": row.get("kmz_message",""),
+                "status_veg_tiff": row.get("status_veg_tiff",""), "file_veg_tiff": row.get("file_veg_tiff",""), "veg_tiff_message": row.get("veg_tiff_message",""),
+                "status_veg_kmz": row.get("status_veg_kmz",""), "file_veg_kmz": row.get("file_veg_kmz",""), "veg_kmz_message": row.get("veg_kmz_message",""),
+            })
+        zf.writestr("manifest.csv", mem_csv.getvalue().encode("utf-8"))
 
     zip_buf.seek(0)
     stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
