@@ -49,7 +49,8 @@ def home_head(): return Response(status_code=200)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """<!doctype html>
+    # Replace configuration placeholders with actual values
+    html_template = """<!doctype html>
 <html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>QLD Land Types (rewritten)</title>
@@ -146,7 +147,7 @@ function parseItems(text){
     .replace(/\bON\b/g,' ')
     .replace(/[^A-Z0-9]+/g,' ');
   const seen = new Set(); const out = [];
-  const rx = /(\d+)\s*([A-Z]+[A-Z0-9]+)/g; let m;
+  const rx = /(\\d+)\\s*([A-Z]+[A-Z0-9]+)/g; let m;
   while((m = rx.exec(src)) !== null){
     const code = `${m[1]}${m[2]}`;
     if(!seen.has(code)){ seen.add(code); out.push(code); }
@@ -248,7 +249,10 @@ document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDe
 document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
 updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
-</body></html>""".replace("%VEG_URL%", VEG_SERVICE_URL_DEFAULT).replace("%VEG_LAYER%", str(VEG_LAYER_ID_DEFAULT)).replace("%VEG_NAME%", VEG_NAME_FIELD_DEFAULT).replace("%VEG_CODE%", VEG_CODE_FIELD_DEFAULT or "")
+</body></html>"""
+    
+    # Replace configuration placeholders with actual values
+    return html_template.replace("%VEG_URL%", VEG_SERVICE_URL_DEFAULT).replace("%VEG_LAYER%", str(VEG_LAYER_ID_DEFAULT)).replace("%VEG_NAME%", VEG_NAME_FIELD_DEFAULT).replace("%VEG_CODE%", VEG_CODE_FIELD_DEFAULT or "")
 
 @app.get("/health")
 def health(): return {"ok": True}
