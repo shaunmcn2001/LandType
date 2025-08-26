@@ -1,28 +1,26 @@
 # app/main.py
-import os, tempfile, logging, zipfile, csv, datetime as dt, io
+import os, io, csv, zipfile, tempfile, logging, datetime as dt
 from io import BytesIO
 from enum import Enum
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query, Body, Request
+from fastapi import FastAPI, HTTPException, Query, Body, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .arcgis import (
-    fetch_parcel_geojson,
-    fetch_landtypes_intersecting_envelope,
-    fetch_features_intersecting_envelope,  # ensure present in app/arcgis.py
-)
-from .rendering import to_shapely_union, bbox_3857, prepare_clipped_shapes, make_geotiff_rgba
+from .config import VEG_SERVICE_URL_DEFAULT, VEG_LAYER_ID_DEFAULT, VEG_NAME_FIELD_DEFAULT, VEG_CODE_FIELD_DEFAULT
+from .arcgis import fetch_parcel_geojson, fetch_landtypes_intersecting_envelope, fetch_features_intersecting_envelope
+from .geometry import to_shapely_union, bbox_3857, prepare_clipped_shapes
+from .raster import make_geotiff_rgba
 from .colors import color_from_code
 from .kml import build_kml, write_kmz
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(
-    title="QLD Land Types → GeoTIFF + KMZ (Unified + Vegetation)",
-    description="Single or bulk export from one box: Land Types & optional Vegetation (GeoTIFF/KMZ).",
-    version="2.8.1",
+    title="QLD Land Types (rewritten)",
+    description="Unified single/bulk exporter for Land Types + optional Vegetation (GeoTIFF, KMZ).",
+    version="3.0.1",
 )
 
 app.add_middleware(
@@ -33,158 +31,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Vegetation defaults (env-overridable)
-VEG_SERVICE_URL_DEFAULT = os.getenv(
-    "VEG_SERVICE_URL",
-    "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer",
-).strip()
-VEG_LAYER_ID_DEFAULT = int(os.getenv("VEG_LAYER_ID", "109"))
-VEG_NAME_FIELD_DEFAULT = os.getenv("VEG_NAME_FIELD", "CLASS_NAME").strip()
-VEG_CODE_FIELD_DEFAULT = os.getenv("VEG_CODE_FIELD", "CLASS_CODE").strip() or None
-
-def rgb_to_hex(rgb):
-    r, g, b = rgb
-    return "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
+def _hex(rgb):
+    r,g,b = rgb
+    return "#{:02x}{:02x}{:02x}".format(int(r),int(g),int(b))
 
 def _sanitize_filename(s: Optional[str]) -> str:
     base = "".join(c for c in (s or "").strip() if c.isalnum() or c in ("_", "-", ".", " "))
     return (base or "download").strip()
 
-def _require_parcel_fc(lotplan: str) -> Dict[str, Any]:
-    lotplan = (lotplan or "").strip().upper()
-    if not lotplan:
-        raise HTTPException(status_code=400, detail="lotplan is required")
-    fc = fetch_parcel_geojson(lotplan)
-    if not fc or not isinstance(fc, dict) or fc.get("type") != "FeatureCollection" or not fc.get("features"):
-        raise HTTPException(status_code=404, detail=f"Parcel not found for lot/plan '{lotplan}'.")
-    return fc
-
-def _build_kml_compat(clipped, folder_label: str):
-    # Accepts older build_kml signatures (folder_name/doc_name/name)
-    for kw in ("folder_name", "doc_name", "document_name", "name"):
-        try:
-            return build_kml(clipped, color_fn=color_from_code, **{kw: folder_label})
-        except TypeError as e:
-            msg = str(e)
-            if "unexpected keyword argument" in msg or "got multiple values" in msg:
-                continue
-            raise
-    return build_kml(clipped, color_fn=color_from_code)
-
-def _render_one_tiff_and_meta(lotplan: str, max_px: int) -> Tuple[bytes, Dict[str, Any]]:
-    lotplan = (lotplan or "").strip().upper()
-    parcel_fc = _require_parcel_fc(lotplan)
-    parcel_union = to_shapely_union(parcel_fc)
-    env = bbox_3857(parcel_union)
-    lt_fc = fetch_landtypes_intersecting_envelope(env)
-    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-    if not clipped:
-        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-    tmpdir = tempfile.mkdtemp(prefix="geotiff_")
-    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.tif")
-    try:
-        _ = make_geotiff_rgba(clipped, out_path, max_px=max_px)
-        with open(out_path, "rb") as f:
-            tiff_bytes = f.read()
-    finally:
-        try:
-            if os.path.exists(out_path): os.remove(out_path)
-            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-        except Exception:
-            pass
-    west, south, east, north = parcel_union.bounds
-    total_area_ha = sum(float(a_ha) for _, _, _, a_ha in clipped)
-    meta = {"lotplan": lotplan, "bounds_epsg4326": [west, south, east, north], "area_ha_total": total_area_ha}
-    return tiff_bytes, meta
-
-def _standardise_code_name(fc: Dict[str, Any], code_field: Optional[str], name_field: str) -> Dict[str, Any]:
-    feats = fc.get("features", [])
-    for f in feats:
-        props = f.get("properties") or {}
-        code = str(props.get(code_field, "")).strip() if code_field else ""
-        name = str(props.get(name_field, "")).strip() if name_field else ""
-        if not code: code = name or "UNK"
-        if not name: name = code
-        f["properties"] = {"code": code, "name": name}
-    fc["features"] = feats
-    return fc
-
-def _render_one_veg_kmz_and_meta(
-    lotplan: str,
-    env_3857,
-    simplify_tolerance: float,
-    veg_service_url: str,
-    veg_layer_id: int,
-    veg_name_field: str,
-    veg_code_field: Optional[str],
-    parcel_fc: Dict[str, Any],
-) -> Tuple[bytes, Dict[str, Any]]:
-    veg_fc = fetch_features_intersecting_envelope(veg_service_url, veg_layer_id, env_3857)
-    veg_fc = _standardise_code_name(veg_fc, veg_code_field, veg_name_field)
-    clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-    if not clipped:
-        raise HTTPException(status_code=404, detail="No Vegetation polygons intersect this parcel.")
-    if simplify_tolerance and simplify_tolerance > 0:
-        simplified = []
-        for geom4326, code, name, area_ha in clipped:
-            g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
-            if not g2.is_empty: simplified.append((g2, code, name, area_ha))
-        clipped = simplified or clipped
-    kml = _build_kml_compat(clipped, f"Vegetation – {lotplan}")
-    tmpdir = tempfile.mkdtemp(prefix="vegkmz_")
-    out_path = os.path.join(tmpdir, f"{lotplan}_vegetation.kmz")
-    try:
-        write_kmz(kml, out_path)
-        with open(out_path, "rb") as f:
-            kmz_bytes = f.read()
-    finally:
-        try:
-            if os.path.exists(out_path): os.remove(out_path)
-            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-        except Exception:
-            pass
-    return kmz_bytes, {"lotplan": lotplan}
-
-def _render_one_veg_tiff_and_meta(
-    lotplan: str,
-    env_3857,
-    max_px: int,
-    veg_service_url: str,
-    veg_layer_id: int,
-    veg_name_field: str,
-    veg_code_field: Optional[str],
-    parcel_fc: Dict[str, Any],
-) -> Tuple[bytes, Dict[str, Any]]:
-    veg_fc = fetch_features_intersecting_envelope(veg_service_url, veg_layer_id, env_3857)
-    veg_fc = _standardise_code_name(veg_fc, veg_code_field, veg_name_field)
-    clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-    if not clipped:
-        raise HTTPException(status_code=404, detail="No Vegetation polygons intersect this parcel.")
-    tmpdir = tempfile.mkdtemp(prefix="vegtif_")
-    out_path = os.path.join(tmpdir, f"{lotplan}_vegetation.tif")
-    try:
-        _ = make_geotiff_rgba(clipped, out_path, max_px=max_px)
-        with open(out_path, "rb") as f:
-            tiff_bytes = f.read()
-    finally:
-        try:
-            if os.path.exists(out_path): os.remove(out_path)
-            if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-        except Exception:
-            pass
-    return tiff_bytes, {"lotplan": lotplan}
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    logging.exception("Unhandled error during %s %s", request.method, request.url)
-    return JSONResponse(status_code=500, content={"error": "internal_server_error", "detail": str(exc)})
+@app.head("/")
+def home_head(): return Response(status_code=200)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    html = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>QLD Land Types → GeoTIFF + KMZ (Unified + Vegetation)</title>
+    return """<!doctype html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>QLD Land Types (rewritten)</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 <style>
 :root{--bg:#0b1220;--card:#121a2b;--text:#e8eefc;--muted:#9fb2d8;--accent:#6aa6ff}
@@ -201,10 +64,11 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
 .chip{display:inline-flex;align-items:center;gap:6px;padding:.2rem .6rem;border-radius:999px;background:#11204a;color:#9fc1ff;font-size:12px}
 .muted{color:#9fb2d8}.box{border:1px solid #203055;border-radius:12px;padding:10px;background:#0e1526;margin-top:6px}
 </style>
-</head><body>
+</head>
+<body>
 <div class="wrap"><div class="card">
   <h1>QLD Land Types <span class="badge">EPSG:4326</span> <span id="mode" class="chip">Mode: Single</span></h1>
-  <p>Paste one or many <strong>Lot / Plan</strong> codes. Choose formats, optionally include <strong>Vegetation</strong> outputs.</p>
+  <p>Paste one or many <strong>Lot / Plan</strong> codes. Choose formats, optionally include <strong>Vegetation</strong>.</p>
 
   <div class="row">
     <div style="flex: 2 1 420px;">
@@ -237,14 +101,13 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
     <label><input type="checkbox" id="veg_tiff"> Include Vegetation <b>GeoTIFF</b></label>
     <label><input type="checkbox" id="veg_kmz"> Include Vegetation <b>KMZ</b></label>
     <div class="row">
-      <div><label for="veg_url">Vegetation MapServer URL</label><input id="veg_url" type="text" value="https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Biota/VegetationManagement/MapServer"/></div>
-      <div><label for="veg_layer">Layer ID</label><input id="veg_layer" type="number" min="0" value="109"/></div>
+      <div><label for="veg_url">Vegetation MapServer URL</label><input id="veg_url" type="text" value="%VEG_URL%"/></div>
+      <div><label for="veg_layer">Layer ID</label><input id="veg_layer" type="number" min="0" value="%VEG_LAYER%"/></div>
     </div>
     <div class="row">
-      <div><label for="veg_name">Vegetation name field</label><input id="veg_name" type="text" value="CLASS_NAME"/></div>
-      <div><label for="veg_code">Vegetation code field (optional)</label><input id="veg_code" type="text" value="CLASS_CODE"/></div>
+      <div><label for="veg_name">Vegetation name field</label><input id="veg_name" type="text" value="%VEG_NAME%"/></div>
+      <div><label for="veg_code">Vegetation code field (optional)</label><input id="veg_code" type="text" value="%VEG_CODE%"/></div>
     </div>
-    <div class="muted">Tip: If you're unsure of the field names, try leaving code empty and set name to the display field.</div>
   </div>
 
   <div class="btns">
@@ -253,7 +116,7 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
     <a class="ghost" id="btn-load" href="#">Load on Map (single)</a>
   </div>
 
-  <div class="note">API docs: <a href="/docs">/docs</a>.  JSON/Map actions are enabled only when exactly one code is provided.</div>
+  <div class="note">JSON/Map actions require exactly one lot/plan. API docs: <a href="/docs">/docs</a></div>
   <div id="map"></div><div id="out" class="out"></div>
 </div></div>
 
@@ -271,50 +134,35 @@ const $items = document.getElementById('items'), $fmt = document.getElementById(
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
-  const raw = (text || '').split(/\r?\n|,|;/);
+  const raw = (text || '').split(/\\r?\\n|,|;/);
   const clean = raw.map(s => s.trim().toUpperCase()).filter(Boolean);
   const seen = new Set(); const out = [];
-  for (const v of clean){ if (!seen.has(v)) { seen.add(v); out.push(v); } }
+  for(const v of clean){ if(!seen.has(v)){ seen.add(v); out.push(v); } }
   return out;
 }
-
 function updateMode(){
-  try{
-    const items = parseItems($items.value);
-    const n = items.length;
-    const dupInfo = (normText($items.value) && n === 0) ? " (duplicates/invalid removed)" : "";
-    $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.` + dupInfo;
-
-    if (n === 1){
-      $mode.textContent = "Mode: Single";
-      $btnJson.style.pointerEvents='auto'; $btnJson.style.opacity='1';
-      $btnLoad.style.pointerEvents='auto'; $btnLoad.style.opacity='1';
-    } else {
-      $mode.textContent = `Mode: Bulk (${n})`;
-      $btnJson.style.pointerEvents='none'; $btnJson.style.opacity='.5';
-      $btnLoad.style.pointerEvents='none'; $btnLoad.style.opacity='.5';
-    }
-  }catch(e){
-    console.warn("updateMode failed:", e);
+  const items = parseItems($items.value);
+  const n = items.length;
+  $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.`;
+  if (n === 1){
+    $mode.textContent = "Mode: Single"; $btnJson.style.opacity='1'; $btnJson.style.pointerEvents='auto'; $btnLoad.style.opacity='1'; $btnLoad.style.pointerEvents='auto';
+  } else {
+    $mode.textContent = `Mode: Bulk (${n})`; $btnJson.style.opacity='.5'; $btnJson.style.pointerEvents='none'; $btnLoad.style.opacity='.5'; $btnLoad.style.pointerEvents='none';
   }
 }
 
-// ---- Map (lazy + guarded) ----
 let map=null, parcelLayer=null, ltLayer=null;
-
 function ensureMap(){
   try{
-    if (map || !document.getElementById('map')) return;
-    if (!window.L) { console.warn('Leaflet not loaded yet; map will init on demand.'); return; }
+    if (map) return;
+    if (!window.L) return;
     map = L.map('map', { zoomControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
     map.setView([-23.5, 146.0], 5);
   }catch(e){ console.warn('Map init failed:', e); }
 }
-
 function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
 function clearLayers(){ try{ if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }catch{} }
-
 function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
 
 async function loadVector(){
@@ -358,160 +206,128 @@ async function exportAny(){
     format: $fmt.value,
     max_px: parseInt($max.value || '4096', 10),
     simplify_tolerance: parseFloat($simp.value || '0') || 0,
-    include_veg_tiff: !!document.getElementById('veg_tiff')?.checked,
-    include_veg_kmz: !!document.getElementById('veg_kmz')?.checked,
-    veg_service_url: normText($vegURL?.value || ''),
-    veg_layer_id: $vegLayer?.value ? parseInt($vegLayer.value, 10) : null,
-    veg_name_field: normText($vegName?.value || ''),
-    veg_code_field: normText($vegCode?.value || ''),
+    include_veg_tiff: !!$vegT.checked, include_veg_kmz: !!$vegK.checked,
+    veg_service_url: normText($vegURL.value||''), veg_layer_id: $vegLayer.value ? parseInt($vegLayer.value,10) : null,
+    veg_name_field: normText($vegName.value||''), veg_code_field: normText($vegCode.value||''),
   };
   const name = normText($name.value) || null;
-  if (items.length === 1){ body.lotplan = items[0]; if (name) body.filename = name; }
-  else { body.lotplans = items; if (name) body.filename_prefix = name; }
-
+  if (items.length === 1){ body.lotplan = items[0]; if (name) body.filename = name; } else { body.lotplans = items; if (name) body.filename_prefix = name; }
   $out.textContent = items.length === 1 ? 'Exporting…' : `Exporting ${items.length} items…`;
   try{
     const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const disp = res.headers.get('content-disposition') || '';
-    if (!res.ok){ const txt = await res.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
+    const ok = res.ok;
+    const blob = await res.blob();
+    if (!ok){ const txt = await blob.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
     const m = /filename="([^"]+)"/i.exec(disp);
     let dl = m ? m[1] : `export_${Date.now()}`;
     if (items.length > 1 && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = dl; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = dl; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     $out.textContent = 'Download complete.';
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
-// Bind listeners *before* any map work
 $items.addEventListener('input', updateMode);
 $items.addEventListener('keyup', updateMode);
 $items.addEventListener('change', updateMode);
 document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
 document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
 document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
-
-// Initial UI pass
-updateMode();
-setTimeout(()=>{ $items.focus(); ensureMap(); }, 50);
+updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
-</body></html>"""
-    return HTMLResponse(html)
-
+</body></html>""".replace("%VEG_URL%", VEG_SERVICE_URL_DEFAULT).replace("%VEG_LAYER%", str(VEG_LAYER_ID_DEFAULT)).replace("%VEG_NAME%", VEG_NAME_FIELD_DEFAULT).replace("%VEG_CODE%", VEG_CODE_FIELD_DEFAULT or "")
+    
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health(): return {"ok": True}
 
 @app.get("/export")
-def export_geotiff(
-    lotplan: str = Query(...),
-    max_px: int = Query(4096, ge=256, le=8192),
-    download: bool = Query(True),
-    filename: Optional[str] = Query(None),
-):
-    try:
-        lotplan = lotplan.strip().upper()
-        if download:
-            tiff_bytes, meta = _render_one_tiff_and_meta(lotplan, max_px)
-            name = _sanitize_filename(filename) if filename else f"{meta['lotplan']}_landtypes"
-            if not name.lower().endswith(".tif"): name += ".tif"
-            return StreamingResponse(BytesIO(tiff_bytes), media_type="image/tiff",
-                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
-        else:
-            _bytes, meta = _render_one_tiff_and_meta(lotplan, max_px)
-            return JSONResponse({"lotplan": meta["lotplan"], **meta})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("Export error")
-        raise HTTPException(status_code=500, detail=str(e))
+def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, le=8192), download: bool = Query(True)):
+    lotplan = lotplan.strip().upper()
+    parcel_fc = fetch_parcel_geojson(lotplan)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    if not clipped: 
+        if download: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+        return JSONResponse({"lotplan": lotplan, "error": "No Land Types intersect this parcel."}, status_code=404)
+    tmpdir = tempfile.mkdtemp(prefix="tiff_")
+    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.tif")
+    result = make_geotiff_rgba(clipped, out_path, max_px=max_px)
+    if download:
+        data = open(out_path, "rb").read()
+        os.remove(out_path); os.rmdir(tmpdir)
+        return StreamingResponse(BytesIO(data), media_type="image/tiff", headers={"Content-Disposition": f'attachment; filename=\"{lotplan}_landtypes.tif\""})
+    else:
+        public = {k:v for k,v in result.items() if k != "path"}
+        legend = {}
+        for _g, code, name, area_ha in clipped:
+            c = _hex(color_from_code(code))
+            legend.setdefault(code, {"code":code,"name":name,"color_hex":c,"area_ha":0.0})
+            legend[code]["area_ha"] += float(area_ha)
+        return JSONResponse({"lotplan": lotplan, "legend": sorted(legend.values(), key=lambda d: (-d["area_ha"], d["code"])), **public})
 
 @app.get("/vector")
 def vector_geojson(lotplan: str = Query(...)):
-    try:
-        lotplan = lotplan.strip().upper()
-        parcel_fc = _require_parcel_fc(lotplan)
-        parcel_union = to_shapely_union(parcel_fc)
-        env = bbox_3857(parcel_union)
-        lt_fc = fetch_landtypes_intersecting_envelope(env)
-        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-        if not clipped:
-            return JSONResponse({"error": "No Land Types intersect this parcel."}, status_code=404)
+    lotplan = lotplan.strip().upper()
+    parcel_fc = fetch_parcel_geojson(lotplan)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    if not clipped:
+        return JSONResponse({"error": "No Land Types intersect this parcel."}, status_code=404)
 
-        features = []
-        legend_map = {}
-        from shapely.geometry import mapping as shp_mapping
-        for geom4326, code, name, area_ha in clipped:
-            color_hex = rgb_to_hex(color_from_code(code))
-            features.append({
-                "type": "Feature",
-                "geometry": shp_mapping(geom4326),
-                "properties": {"code": code, "name": name, "area_ha": float(area_ha), "color_hex": color_hex}
-            })
-            legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
-            legend_map[code]["area_ha"] += float(area_ha)
-
-        union_bounds = to_shapely_union({
-            "type":"FeatureCollection",
-            "features":[{"type":"Feature","geometry":f["geometry"],"properties":{}} for f in features]
-        }).bounds
-        west, south, east, north = union_bounds
-
-        return JSONResponse({
-            "lotplan": lotplan,
-            "parcel": parcel_fc,
-            "landtypes": { "type":"FeatureCollection", "features": features },
-            "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
-            "bounds4326": {"west": west, "south": south, "east": east, "north": north}
+    features = []
+    legend_map = {}
+    from shapely.geometry import mapping as shp_mapping
+    for geom4326, code, name, area_ha in clipped:
+        color_hex = _hex(color_from_code(code))
+        features.append({
+            "type": "Feature",
+            "geometry": shp_mapping(geom4326),
+            "properties": {"code": code, "name": name, "area_ha": float(area_ha), "color_hex": color_hex}
         })
-    except Exception as e:
-        logging.exception("Vector export error")
-        raise HTTPException(status_code=500, detail=str(e))
+        legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
+        legend_map[code]["area_ha"] += float(area_ha)
+
+    union_bounds = to_shapely_union({
+        "type":"FeatureCollection",
+        "features":[{"type":"Feature","geometry":f["geometry"],"properties":{}} for f in features]
+    }).bounds
+    west, south, east, north = union_bounds
+    return JSONResponse({
+        "lotplan": lotplan,
+        "parcel": parcel_fc,
+        "landtypes": { "type":"FeatureCollection", "features": features },
+        "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
+        "bounds4326": {"west": west, "south": south, "east": east, "north": north}
+    })
 
 @app.get("/export_kmz")
-def export_kmz(
-    lotplan: str = Query(...),
-    simplify_tolerance: float = Query(0.0, ge=0.0, le=0.001),
-    filename: Optional[str] = Query(None),
-):
-    try:
-        lotplan = lotplan.strip().upper()
-        parcel_fc = _require_parcel_fc(lotplan)
-        parcel_union = to_shapely_union(parcel_fc)
-        env = bbox_3857(parcel_union)
-        lt_fc = fetch_landtypes_intersecting_envelope(env)
-        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-        if not clipped:
-            raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-        if simplify_tolerance and simplify_tolerance > 0:
-            simplified = []
-            for geom4326, code, name, area_ha in clipped:
-                g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
-                if not g2.is_empty: simplified.append((g2, code, name, area_ha))
-            clipped = simplified or clipped
-        kml = _build_kml_compat(clipped, f"QLD Land Types – {lotplan}")
-        tmpdir = tempfile.mkdtemp(prefix="kmz_")
-        out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
-        try:
-            write_kmz(kml, out_path)
-            with open(out_path, "rb") as f:
-                kmz_bytes = f.read()
-        finally:
-            try:
-                if os.path.exists(out_path): os.remove(out_path)
-                if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-            except Exception:
-                pass
-        name = _sanitize_filename(filename) if filename else f"{lotplan}_landtypes"
-        if not name.lower().endswith(".kmz"): name += ".kmz"
-        return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz",
-                                 headers={"Content-Disposition": f'attachment; filename="{name}"'})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("KMZ export error")
-        raise HTTPException(status_code=500, detail=str(e))
+def export_kmz(lotplan: str = Query(...), simplify_tolerance: float = Query(0.0, ge=0.0, le=0.001)):
+    lotplan = lotplan.strip().upper()
+    parcel_fc = fetch_parcel_geojson(lotplan)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+    lt_fc = fetch_landtypes_intersecting_envelope(env)
+    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    if not clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+
+    if simplify_tolerance and simplify_tolerance > 0:
+        simplified = []
+        for geom4326, code, name, area_ha in clipped:
+            g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
+            if not g2.is_empty: simplified.append((g2, code, name, area_ha))
+        clipped = simplified or clipped
+
+    kml = build_kml(clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lotplan}")
+    tmpdir = tempfile.mkdtemp(prefix="kmz_")
+    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
+    write_kmz(kml, out_path)
+    data = open(out_path, "rb").read()
+    os.remove(out_path); os.rmdir(tmpdir)
+    return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz", headers={"Content-Disposition": f'attachment; filename=\"{lotplan}_landtypes.kmz\"'} )
 
 class FormatEnum(str, Enum):
     tiff = "tiff"
@@ -546,33 +362,36 @@ def export_any(payload: ExportAnyRequest = Body(...)):
         lp = payload.lotplan.strip().upper()
         if lp and lp not in items:
             items.append(lp)
-    if not items:
-        raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
+    if not items: raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
 
     want_veg = payload.include_veg_tiff or payload.include_veg_kmz
     veg_url = (payload.veg_service_url or VEG_SERVICE_URL_DEFAULT or "").strip()
     veg_layer = payload.veg_layer_id if payload.veg_layer_id is not None else VEG_LAYER_ID_DEFAULT
     veg_name = (payload.veg_name_field or VEG_NAME_FIELD_DEFAULT or "").strip()
     veg_code = (payload.veg_code_field or VEG_CODE_FIELD_DEFAULT or "").strip() or None
-    if want_veg:
-        if not veg_url or veg_layer is None or not veg_name:
-            raise HTTPException(status_code=400, detail="Vegetation enabled but veg_service_url, veg_layer_id, or veg_name_field missing.")
+    if want_veg and (not veg_url or veg_layer is None or not veg_name):
+        raise HTTPException(status_code=400, detail="Vegetation enabled but veg_service_url, veg_layer_id, or veg_name_field missing.")
 
-    multi_files = (len(items) > 1) or (payload.format == FormatEnum.both) or want_veg
     prefix = _sanitize_filename(payload.filename_prefix) if payload.filename_prefix else None
+    multi_files = (len(items) > 1) or (payload.format == FormatEnum.both) or want_veg
 
     if not multi_files:
         lp = items[0]
         if payload.format == FormatEnum.tiff:
-            tiff_bytes, _ = _render_one_tiff_and_meta(lp, payload.max_px)
-            name = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
-            if not name.lower().endswith(".tif"): name += ".tif"
-            return StreamingResponse(BytesIO(tiff_bytes), media_type="image/tiff",
-                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
-        if payload.format == FormatEnum.kmz:
-            parcel_fc = _require_parcel_fc(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
-            lt_fc = fetch_landtypes_intersecting_envelope(env)
-            clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+            parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
+            thematic_fc = fetch_landtypes_intersecting_envelope(env)
+            clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
+            if not clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+            tmpdir = tempfile.mkdtemp(prefix="tif_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.tif")
+            _ = make_geotiff_rgba(clipped, out_path, max_px=payload.max_px)
+            data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
+            fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
+            if not fname.lower().endswith(".tif"): fname += ".tif"
+            return StreamingResponse(BytesIO(data), media_type="image/tiff", headers={"Content-Disposition": f'attachment; filename=\"{fname}\"'})
+        elif payload.format == FormatEnum.kmz:
+            parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
+            thematic_fc = fetch_landtypes_intersecting_envelope(env)
+            clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
             if not clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
             if payload.simplify_tolerance and payload.simplify_tolerance > 0:
                 simplified = []
@@ -580,21 +399,16 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                     g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
                     if not g2.is_empty: simplified.append((g2, code, name, area_ha))
                 clipped = simplified or clipped
-            kml = _build_kml_compat(clipped, f"QLD Land Types – {lp}")
+            kml = build_kml(clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lp}")
             tmpdir = tempfile.mkdtemp(prefix="kmz_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.kmz")
-            try:
-                write_kmz(kml, out_path); kmz_bytes = open(out_path, "rb").read()
-            finally:
-                try:
-                    if os.path.exists(out_path): os.remove(out_path)
-                    if os.path.isdir(tmpdir): os.rmdir(tmpdir)
-                except Exception: pass
-            name = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
-            if not name.lower().endswith(".kmz"): name += ".kmz"
-            return StreamingResponse(BytesIO(kmz_bytes), media_type="application/vnd.google-earth.kmz",
-                                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
-        raise HTTPException(status_code=400, detail="Unsupported format for single export.")
+            write_kmz(kml, out_path); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
+            fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
+            if not fname.lower().endswith(".kmz"): fname += ".kmz"
+            return StreamingResponse(BytesIO(data), media_type="application/vnd.google-earth.kmz", headers={"Content-Disposition": f'attachment; filename=\"{fname}\"'})
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported format.")
 
+    # multi/zip
     zip_buf = BytesIO()
     manifest_rows: List[Dict[str, Any]] = []
 
@@ -602,93 +416,94 @@ def export_any(payload: ExportAnyRequest = Body(...)):
         for lp in items:
             row: Dict[str, Any] = {"lotplan": lp}
             try:
-                parcel_fc = _require_parcel_fc(lp)
+                parcel_fc = fetch_parcel_geojson(lp)
                 parcel_union = to_shapely_union(parcel_fc)
                 env = bbox_3857(parcel_union)
-            except HTTPException as e:
-                row.update({"status": f"error:{e.status_code}", "message": e.detail})
-                manifest_rows.append(row); continue
             except Exception as e:
-                row.update({"status": "error:500", "message": str(e)})
+                row.update({"status": "error:parcel", "message": str(e)})
                 manifest_rows.append(row); continue
 
-            if payload.format in (FormatEnum.tiff, FormatEnum.both):
-                try:
-                    tiff_bytes, _ = _render_one_tiff_and_meta(lp, payload.max_px)
-                    name_tif = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
-                    zf.writestr(name_tif, tiff_bytes)
-                    row["file_tiff"] = name_tif; row["status_tiff"] = "ok"
-                except Exception as e:
-                    row["status_tiff"] = f"error:{getattr(e, 'status_code', 500)}"; row["tiff_message"] = str(e)
+            # Land Types
+            try:
+                thematic_fc = fetch_landtypes_intersecting_envelope(env)
+                clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
+                if clipped:
+                    if payload.format in (FormatEnum.tiff, FormatEnum.both):
+                        tmpdir = tempfile.mkdtemp(prefix="tif_"); path = os.path.join(tmpdir, f"{lp}_landtypes.tif")
+                        _ = make_geotiff_rgba(clipped, path, max_px=payload.max_px)
+                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif", open(path,"rb").read())
+                        try: os.remove(path); os.rmdir(tmpdir)
+                        except: pass
+                        row["status_tiff"]="ok"; row["file_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
+                    if payload.format in (FormatEnum.kmz, FormatEnum.both):
+                        if payload.simplify_tolerance and payload.simplify_tolerance > 0:
+                            simplified = []
+                            for geom4326, code, name, area_ha in clipped:
+                                g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
+                                if not g2.is_empty: simplified.append((g2, code, name, area_ha))
+                            clipped = simplified or clipped
+                        kml = build_kml(clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lp}")
+                        mem = BytesIO()
+                        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
+                            ztmp.writestr("doc.kml", kml.encode("utf-8"))
+                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz", mem.getvalue())
+                        row["status_kmz"]="ok"; row["file_kmz"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
+                else:
+                    row["status_tiff"]="skip"; row["status_kmz"]="skip"; row["message"]="No Land Types intersect."
+            except Exception as e:
+                row["lt_error"]=str(e)
 
-            if payload.format in (FormatEnum.kmz, FormatEnum.both):
+            # Vegetation (optional)
+            if want_veg:
                 try:
-                    lt_fc = fetch_landtypes_intersecting_envelope(env)
-                    clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-                    if not clipped:
-                        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-                    if payload.simplify_tolerance and payload.simplify_tolerance > 0:
-                        simplified = []
-                        for geom4326, code, name, area_ha in clipped:
-                            g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
-                            if not g2.is_empty: simplified.append((g2, code, name, area_ha))
-                        clipped = simplified or clipped
-                    kml = _build_kml_compat(clipped, f"QLD Land Types – {lp}")
-                    name_kmz = f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
-                    mem = BytesIO()
-                    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
-                        ztmp.writestr("doc.kml", kml.encode("utf-8"))
-                    zf.writestr(name_kmz, mem.getvalue())
-                    row["file_kmz"] = name_kmz; row["status_kmz"] = "ok"
+                    veg_fc = fetch_features_intersecting_envelope(veg_url, veg_layer, env, out_sr=4326, out_fields="*")
+                    feats = veg_fc.get("features", [])
+                    for f in feats:
+                        p = f.get("properties") or {}
+                        code = (p.get(veg_code) if veg_code else "") or (p.get(veg_name) or "UNK")
+                        name = p.get(veg_name) or code
+                        p["code"] = str(code); p["name"] = str(name)
+                        f["properties"] = p
+                    veg_fc["features"] = feats
+                    vclipped = prepare_clipped_shapes(parcel_fc, veg_fc)
+                    if vclipped:
+                        if payload.include_veg_tiff:
+                            tmpdir = tempfile.mkdtemp(prefix="tif_"); path = os.path.join(tmpdir, f"{lp}_vegetation.tif")
+                            _ = make_geotiff_rgba(vclipped, path, max_px=payload.max_px)
+                            zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif", open(path,"rb").read())
+                            try: os.remove(path); os.rmdir(tmpdir)
+                            except: pass
+                            row["status_veg_tiff"]="ok"; row["file_veg_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif"
+                        if payload.include_veg_kmz:
+                            kml = build_kml(vclipped, color_fn=color_from_code, folder_name=f"Vegetation – {lp}")
+                            mem = BytesIO()
+                            with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
+                                ztmp.writestr("doc.kml", kml.encode("utf-8"))
+                            zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_vegetation.kmz", mem.getvalue())
+                            row["status_veg_kmz"]="ok"; row["file_veg_kmz"]=f"{(prefix+'_') if prefix else ''}{lp}_vegetation.kmz"
+                    else:
+                        row["status_veg_tiff"]="skip"; row["status_veg_kmz"]="skip"; row["veg_message"]="No vegetation polygons intersect."
                 except Exception as e:
-                    row["status_kmz"] = f"error:{getattr(e, 'status_code', 500)}"; row["kmz_message"] = str(e)
-
-            if want_veg and payload.include_veg_tiff:
-                try:
-                    veg_tiff, _ = _render_one_veg_tiff_and_meta(
-                        lp, env, payload.max_px, veg_url, veg_layer, veg_name, veg_code, parcel_fc
-                    )
-                    name_vtif = f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif"
-                    zf.writestr(name_vtif, veg_tiff)
-                    row["file_veg_tiff"] = name_vtif; row["status_veg_tiff"] = "ok"
-                except Exception as e:
-                    row["status_veg_tiff"] = f"error:{getattr(e, 'status_code', 500)}"; row["veg_tiff_message"] = str(e)
-
-            if want_veg and payload.include_veg_kmz:
-                try:
-                    veg_kmz, _ = _render_one_veg_kmz_and_meta(
-                        lp, env, payload.simplify_tolerance, veg_url, veg_layer, veg_name, veg_code, parcel_fc
-                    )
-                    name_vkmz = f"{(prefix+'_') if prefix else ''}{lp}_vegetation.kmz"
-                    zf.writestr(name_vkmz, veg_kmz)
-                    row["file_veg_kmz"] = name_vkmz; row["status_veg_kmz"] = "ok"
-                except Exception as e:
-                    row["status_veg_kmz"] = f"error:{getattr(e, 'status_code', 500)}"; row["veg_kmz_message"] = str(e)
+                    row["veg_error"]=str(e)
 
             manifest_rows.append(row)
 
-        # CSV manifest (text mode → bytes for zip)
+        # CSV manifest
         mem_csv = io.StringIO(newline='')
         writer = csv.DictWriter(mem_csv, fieldnames=[
             "lotplan",
-            "status_tiff","file_tiff","tiff_message",
-            "status_kmz","file_kmz","kmz_message",
-            "status_veg_tiff","file_veg_tiff","veg_tiff_message",
-            "status_veg_kmz","file_veg_kmz","veg_kmz_message",
+            "status_tiff","file_tiff","lt_error",
+            "status_kmz","file_kmz",
+            "status_veg_tiff","file_veg_tiff","veg_message",
+            "status_veg_kmz","file_veg_kmz","veg_error",
+            "message"
         ])
         writer.writeheader()
-        for row in manifest_rows:
-            writer.writerow({
-                "lotplan": row.get("lotplan",""),
-                "status_tiff": row.get("status_tiff",""), "file_tiff": row.get("file_tiff",""), "tiff_message": row.get("tiff_message",""),
-                "status_kmz": row.get("status_kmz",""), "file_kmz": row.get("file_kmz",""), "kmz_message": row.get("kmz_message",""),
-                "status_veg_tiff": row.get("status_veg_tiff",""), "file_veg_tiff": row.get("file_veg_tiff",""), "veg_tiff_message": row.get("veg_tiff_message",""),
-                "status_veg_kmz": row.get("status_veg_kmz",""), "file_veg_kmz": row.get("file_veg_kmz",""), "veg_kmz_message": row.get("veg_kmz_message",""),
-            })
+        for r in manifest_rows:
+            writer.writerow({k: r.get(k,"") for k in writer.fieldnames})
         zf.writestr("manifest.csv", mem_csv.getvalue().encode("utf-8"))
 
     zip_buf.seek(0)
     stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base = f"{prefix+'_' if prefix else ''}landtypes_{payload.format.value}"
-    return StreamingResponse(zip_buf, media_type="application/zip",
-                             headers={"Content-Disposition": f'attachment; filename="{base}_with_veg_{stamp}.zip"'})
+    base = f"{prefix+'_' if prefix else ''}export_bundle"
+    return StreamingResponse(zip_buf, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename=\"{base}_{stamp}.zip\""})
