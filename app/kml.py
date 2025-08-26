@@ -2,7 +2,6 @@
 from __future__ import annotations
 from typing import Callable, Iterable, Tuple, Optional
 from zipfile import ZipFile, ZIP_DEFLATED
-from io import BytesIO
 import html
 
 try:
@@ -44,7 +43,10 @@ def _geom_to_kml_polygons(geom) -> Iterable[str]:
         inners = []
         for ring in poly.interiors:
             inners.append(_coords_to_kml_ring(ring.coords))
-        inner_xml = "".join(f"<innerBoundaryIs><LinearRing><coordinates>{ring}</coordinates></LinearRing></innerBoundaryIs>" for ring in inners if ring)
+        inner_xml = "".join(
+            f"<innerBoundaryIs><LinearRing><coordinates>{ring}</coordinates></LinearRing></innerBoundaryIs>"
+            for ring in inners if ring
+        )
         yield f"<Polygon><outerBoundaryIs><LinearRing><coordinates>{ext}</coordinates></LinearRing></outerBoundaryIs>{inner_xml}</Polygon>"
 
 def build_kml(clipped, color_fn: Callable[[str], Tuple[int,int,int]], folder_name: Optional[str] = None, **kwargs) -> str:
@@ -74,10 +76,7 @@ def build_kml(clipped, color_fn: Callable[[str], Tuple[int,int,int]], folder_nam
             polys = []
         if not polys:
             continue
-        if len(polys) == 1:
-            geom_xml = polys[0]
-        else:
-            geom_xml = "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
+        geom_xml = polys[0] if len(polys) == 1 else "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
 
         placemarks.append(
             f"<Placemark>"
