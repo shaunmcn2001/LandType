@@ -3,6 +3,19 @@
 FastAPI app for exporting Queensland **Land Types** (and optional **Vegetation**) as GeoTIFF & KMZ.
 This build bakes in real QLD MapServer endpoints in `app/config.py` so it works without env vars.
 
+## Features
+
+### Bulk KMZ Export with Merged Layers
+When exporting multiple properties as KMZ, the system now includes:
+- **Merged Land Types (All Properties)** - All land type polygons with the same name/code merged across all properties
+- **Merged Vegetation (All Properties)** - All vegetation polygons with the same name/code merged across all properties
+- Individual property folders with their specific land types and vegetation
+
+This enables users to:
+- Measure combined areas across multiple properties in Google Earth
+- View property overviews without MultiPolygon complexity
+- Analyze patterns across multiple lots
+
 ## Run
 ```bash
 python -m venv .venv && source .venv/bin/activate
