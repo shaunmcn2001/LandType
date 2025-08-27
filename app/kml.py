@@ -1,11 +1,12 @@
 # app/kml.py
 from __future__ import annotations
-from typing import Callable, Iterable, Tuple, Optional
-from zipfile import ZipFile, ZIP_DEFLATED
+
 import html
+from typing import Callable, Iterable, Optional, Tuple
+from zipfile import ZIP_DEFLATED, ZipFile
 
 try:
-    from shapely.geometry import Polygon, MultiPolygon
+    from shapely.geometry import MultiPolygon, Polygon
 except Exception:
     Polygon = MultiPolygon = None  # type: ignore
 

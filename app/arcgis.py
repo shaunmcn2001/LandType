@@ -1,12 +1,26 @@
 # app/arcgis.py
 from __future__ import annotations
-import re, json, requests
-from typing import Dict, Any, Optional, Tuple
+
+import json
+import re
+from typing import Any, Dict
+
+import requests
+
 from .config import (
-    PARCEL_SERVICE_URL, PARCEL_LAYER_ID, PARCEL_LOTPLAN_FIELD, PARCEL_LOT_FIELD, PARCEL_PLAN_FIELD,
-    LANDTYPES_SERVICE_URL, LANDTYPES_LAYER_ID, LANDTYPES_CODE_FIELD, LANDTYPES_NAME_FIELD,
-    ARCGIS_TIMEOUT, ARCGIS_MAX_RECORDS,
+    ARCGIS_MAX_RECORDS,
+    ARCGIS_TIMEOUT,
+    LANDTYPES_CODE_FIELD,
+    LANDTYPES_LAYER_ID,
+    LANDTYPES_NAME_FIELD,
+    LANDTYPES_SERVICE_URL,
+    PARCEL_LAYER_ID,
+    PARCEL_LOT_FIELD,
+    PARCEL_LOTPLAN_FIELD,
+    PARCEL_PLAN_FIELD,
+    PARCEL_SERVICE_URL,
 )
+
 
 def _layer_query_url(service_url: str, layer_id: int) -> str:
     return f"{service_url.rstrip('/')}/{int(layer_id)}/query"

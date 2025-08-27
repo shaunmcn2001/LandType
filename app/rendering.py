@@ -1,15 +1,17 @@
-from typing import Dict, Tuple, List
 import re
+from typing import Dict, List, Tuple
+
 import numpy as np
 import rasterio
-from rasterio.transform import from_bounds
-from rasterio.features import rasterize
-from shapely.geometry import shape, mapping, Polygon, MultiPolygon
-from shapely.ops import unary_union
-from shapely import force_2d
 from pyproj import Transformer
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
+from shapely import force_2d
+from shapely.geometry import MultiPolygon, Polygon, mapping, shape
+from shapely.ops import unary_union
 
 from .colors import color_from_code
+
 
 def to_shapely_union(geojson_fc: Dict):
     geoms = []
