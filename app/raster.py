@@ -1,13 +1,17 @@
 # app/raster.py
 from __future__ import annotations
+
 import os
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 import numpy as np
 import rasterio
-from rasterio.transform import from_bounds
 from rasterio.features import rasterize
+from rasterio.transform import from_bounds
 from shapely.geometry import mapping
+
 from .colors import color_from_code
+
 
 def make_geotiff_rgba(clipped: List[tuple], out_path: str, max_px: int = 4096) -> Dict[str, Any]:
     """

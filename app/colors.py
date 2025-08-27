@@ -2,6 +2,7 @@
 import hashlib
 from typing import Tuple
 
+
 # Deterministic color from code string; returns (R,G,B) 0-255
 def color_from_code(code: str) -> Tuple[int,int,int]:
     s = (code or "UNK").encode("utf-8")

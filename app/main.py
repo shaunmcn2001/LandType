@@ -28,7 +28,12 @@ from .config import (
     VEG_NAME_FIELD_DEFAULT,
     VEG_SERVICE_URL_DEFAULT,
 )
-from .geometry import bbox_3857, prepare_clipped_shapes, to_shapely_union
+from .geometry import (
+    bbox_3857,
+    merge_clipped_shapes_across_lots,
+    prepare_clipped_shapes,
+    to_shapely_union,
+)
 from .kml import build_kml, build_kml_folders, build_kml_nested_folders, write_kmz
 from .raster import make_geotiff_rgba
 
@@ -481,6 +486,8 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
     """Create a single KMZ file containing folders for each lot/plan with nested land types and vegetation."""
     
     nested_groups = []
+    all_lt_clipped = []  # Collect all land type data across lots
+    all_veg_clipped = []  # Collect all vegetation data across lots
     
     for lp in items:
         try:
@@ -519,6 +526,12 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
                 if veg_clipped:
                     veg_clipped = _simp(veg_clipped)
             
+            # Store data for merging across lots
+            if lt_clipped:
+                all_lt_clipped.append(lt_clipped)
+            if veg_clipped:
+                all_veg_clipped.append(veg_clipped)
+            
             # Create nested structure: lot folder with land types and veg subfolders
             subfolders = []
             if lt_clipped:
@@ -536,12 +549,30 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
     if not nested_groups:
         raise HTTPException(status_code=404, detail="No data found for any of the provided lot/plans.")
     
+    # Create merged layers across all lots
+    merged_folders = []
+    
+    # Merge land types across all lots
+    if all_lt_clipped:
+        merged_lt = merge_clipped_shapes_across_lots(all_lt_clipped)
+        if merged_lt:
+            merged_folders.append(("Merged Land Types (All Properties)", [(merged_lt, color_from_code, "Land Types")]))
+    
+    # Merge vegetation across all lots
+    if all_veg_clipped:
+        merged_veg = merge_clipped_shapes_across_lots(all_veg_clipped)
+        if merged_veg:
+            merged_folders.append(("Merged Vegetation (All Properties)", [(merged_veg, color_from_code, "Vegetation")]))
+    
+    # Combine merged folders with individual lot folders
+    final_nested_groups = merged_folders + nested_groups
+    
     # Create KML with nested folder structure
     doc_name = f"QLD Bulk Export – {len(items)} lots"
     if prefix:
         doc_name = f"{prefix} – {doc_name}"
         
-    kml = build_kml_nested_folders(nested_groups, doc_name=doc_name)
+    kml = build_kml_nested_folders(final_nested_groups, doc_name=doc_name)
     
     # Create KMZ file
     tmpdir = tempfile.mkdtemp(prefix="bulk_kmz_")
