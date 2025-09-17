@@ -14,6 +14,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from shapely.geometry import mapping as shp_mapping, shape as shp_shape
 
 from .arcgis import (
     fetch_features_intersecting_envelope,
@@ -90,7 +91,7 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
 <body>
 <div class="wrap"><div class="card">
   <h1>QLD Land Types <span class="badge">EPSG:4326</span> <span id="mode" class="chip">Mode: Single</span></h1>
-  <p>Paste one or many <strong>Lot / Plan</strong> codes. Choose formats. <strong>Vegetation data is always included.</strong></p>
+  <p>Paste one or many <strong>Lot / Plan</strong> codes. Downloads include <strong>GeoTIFF</strong> and <strong>KMZ</strong> outputs. <strong>Vegetation data is always included.</strong></p>
 
   <div class="row">
     <div style="flex: 2 1 420px;">
@@ -101,44 +102,39 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
       <div class="muted" id="parseinfo">Detected 0 items.</div>
     </div>
     <div>
-      <label for="fmt">Land Types format</label>
-      <select id="fmt">
-        <option value="tiff" selected>GeoTIFF</option>
-        <option value="kmz">KMZ (clickable)</option>
-        <option value="both">Both (ZIP)</option>
-      </select>
-
       <label for="name">Name (single) or Prefix (bulk)</label>
       <input id="name" type="text" placeholder="e.g. UpperCoomera_13SP181800 or Job_4021" />
-
-      <label for="maxpx">Max raster dimension (px) for GeoTIFF</label>
-      <input id="maxpx" type="number" min="256" max="8192" value="4096" />
-
-      <label for="simp">KMZ simplify tolerance (deg) <span class="muted">(try 0.00005 ≈ 5 m)</span></label>
-      <input id="simp" type="number" step="0.00001" min="0" max="0.001" value="0" />
+      <div class="box muted">Exports always include both GeoTIFF and KMZ files.</div>
     </div>
   </div>
 
 
 
   <div class="btns">
-    <button class="primary" id="btn-export">Export</button>
+    <button class="primary" id="btn-export-tiff">Download GeoTIFF</button>
+    <button class="primary" id="btn-export-kmz">Download KMZ</button>
     <a class="ghost" id="btn-json" href="#">Preview JSON (single)</a>
-    <a class="ghost" id="btn-load" href="#">Load on Map (single)</a>
+    <a class="ghost" id="btn-load" href="#">Load on Map</a>
   </div>
 
-  <div class="note">JSON/Map actions require exactly one lot/plan. API docs: <a href="/docs">/docs</a></div>
+  <div class="note">JSON preview requires exactly one lot/plan. The map supports one or many. API docs: <a href="/docs">/docs</a></div>
   <div id="map"></div><div id="out" class="out"></div>
 </div></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="" defer></script>
 <script>
-const $items = document.getElementById('items'), $fmt = document.getElementById('fmt'),
-      $name = document.getElementById('name'), $max = document.getElementById('maxpx'),
-      $simp = document.getElementById('simp'), $mode = document.getElementById('mode'),
-      $out = document.getElementById('out'), $parseinfo = document.getElementById('parseinfo'),
-      $btnExport = document.getElementById('btn-export'), $btnJson = document.getElementById('btn-json'),
+const $items = document.getElementById('items'),
+      $name = document.getElementById('name'),
+      $mode = document.getElementById('mode'),
+      $out = document.getElementById('out'),
+      $parseinfo = document.getElementById('parseinfo'),
+      $btnExportTiff = document.getElementById('btn-export-tiff'),
+      $btnExportKmz = document.getElementById('btn-export-kmz'),
+      $btnJson = document.getElementById('btn-json'),
       $btnLoad = document.getElementById('btn-load');
+
+const DEFAULT_MAX_PX = 4096;
+const DEFAULT_SIMPLIFY = 0;
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
@@ -160,10 +156,18 @@ function updateMode(){
   const items = parseItems($items.value);
   const n = items.length;
   $parseinfo.textContent = `Detected ${n} item${n===1?'':'s'}.`;
-  if (n === 1){
-    $mode.textContent = "Mode: Single"; $btnJson.style.opacity='1'; $btnJson.style.pointerEvents='auto'; $btnLoad.style.opacity='1'; $btnLoad.style.pointerEvents='auto';
+  if (n === 0){
+    $mode.textContent = "Mode: None";
+    $btnJson.style.opacity='.5'; $btnJson.style.pointerEvents='none';
+    $btnLoad.style.opacity='.5'; $btnLoad.style.pointerEvents='none';
+  } else if (n === 1){
+    $mode.textContent = "Mode: Single";
+    $btnJson.style.opacity='1'; $btnJson.style.pointerEvents='auto';
+    $btnLoad.style.opacity='1'; $btnLoad.style.pointerEvents='auto';
   } else {
-    $mode.textContent = `Mode: Bulk (${n})`; $btnJson.style.opacity='.5'; $btnJson.style.pointerEvents='none'; $btnLoad.style.opacity='.5'; $btnLoad.style.pointerEvents='none';
+    $mode.textContent = `Mode: Bulk (${n})`;
+    $btnJson.style.opacity='.5'; $btnJson.style.pointerEvents='none';
+    $btnLoad.style.opacity='1'; $btnLoad.style.pointerEvents='auto';
   }
 }
 
@@ -183,23 +187,58 @@ function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotp
 
 async function loadVector(){
   const items = parseItems($items.value);
-  if (items.length !== 1){ $out.textContent = 'Provide exactly one Lot/Plan to load map.'; return; }
+  if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan to load map.'; return; }
   ensureMap(); if (!map){ $out.textContent = 'Map library not loaded yet. Try again in a moment.'; return; }
-  const lot = items[0];
-  $out.textContent = 'Loading vector data…';
+  const multi = items.length > 1;
+  $out.textContent = multi ? `Loading vector data for ${items.length} lots/plans…` : 'Loading vector data…';
   try{
-    const res = await fetch(mkVectorUrl(lot)); const data = await res.json();
+    let res, data;
+    if (multi){
+      res = await fetch('/vector/bulk', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ lotplans: items }) });
+    } else {
+      res = await fetch(mkVectorUrl(items[0]));
+    }
+    data = await res.json();
+    if (!res.ok){
+      const msg = data && (data.detail || data.error) ? (data.detail || data.error) : 'Unexpected server response.';
+      $out.textContent = `Error ${res.status}: ${msg}`;
+      return;
+    }
     if (data.error){ $out.textContent = 'Error: ' + data.error; return; }
     clearLayers();
-    parcelLayer = L.geoJSON(data.parcel, { style: { color: '#ffcc00', weight:2, fillOpacity:0 } }).addTo(map);
-    ltLayer = L.geoJSON(data.landtypes, { style: f => styleForCode(f.properties.code, f.properties.color_hex),
-      onEachFeature: (feature, layer) => {
-        const p = feature.properties || {};
-        const html = `<b>${p.name || 'Unknown'}</b><br/>Code: <code>${p.code || 'UNK'}</code><br/>Area: ${(p.area_ha ?? 0).toFixed(2)} ha`;
-        layer.bindPopup(html);
-      }}).addTo(map);
-    const b = data.bounds4326; if (b){ map.fitBounds([[b.south, b.west],[b.north, b.east]], { padding:[20,20] }); }
-    $out.textContent = JSON.stringify({ lotplan: data.lotplan, legend: data.legend, bounds4326: data.bounds4326 }, null, 2);
+    const parcelData = data.parcels || data.parcel;
+    if (parcelData){
+      parcelLayer = L.geoJSON(parcelData, {
+        style: { color: '#ffcc00', weight:2, fillOpacity:0 },
+        onEachFeature: (feature, layer) => {
+          const p = feature.properties || {};
+          if (p.lotplan){ layer.bindPopup(`<strong>Lot/Plan:</strong> ${p.lotplan}`); }
+        }
+      }).addTo(map);
+    }
+    const ltData = data.landtypes;
+    if (ltData && ltData.features && ltData.features.length){
+      ltLayer = L.geoJSON(ltData, { style: f => styleForCode(f.properties.code, f.properties.color_hex),
+        onEachFeature: (feature, layer) => {
+          const p = feature.properties || {};
+          const html = `<b>${p.name || 'Unknown'}</b><br/>Code: <code>${p.code || 'UNK'}</code><br/>Area: ${(p.area_ha ?? 0).toFixed(2)} ha${p.lotplan ? `<br/>Lot/Plan: ${p.lotplan}` : ''}`;
+          layer.bindPopup(html);
+        }}).addTo(map);
+    }
+    const b = data.bounds4326;
+    if (b){
+      map.fitBounds([[b.south, b.west],[b.north, b.east]], { padding:[20,20] });
+    } else if (parcelLayer && parcelLayer.getBounds){
+      map.fitBounds(parcelLayer.getBounds(), { padding:[20,20] });
+    } else if (ltLayer && ltLayer.getBounds){
+      map.fitBounds(ltLayer.getBounds(), { padding:[20,20] });
+    }
+    const summary = {
+      lotplans: data.lotplans || (data.lotplan ? [data.lotplan] : []),
+      legend: data.legend || [],
+      bounds4326: data.bounds4326 || null
+    };
+    $out.textContent = JSON.stringify(summary, null, 2);
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
@@ -209,26 +248,28 @@ async function previewJson(){
   const lot = items[0];
   $out.textContent='Requesting JSON summary…';
   try{
-    const url = `/export?lotplan=${encodeURIComponent(lot)}&max_px=${encodeURIComponent(($max.value || '4096').trim())}&download=false`;
+    const url = `/export?lotplan=${encodeURIComponent(lot)}&max_px=${DEFAULT_MAX_PX}&download=false`;
     const res = await fetch(url); const txt = await res.text();
     try{ const data = JSON.parse(txt); $out.textContent = JSON.stringify(data, null, 2);}catch{ $out.textContent = `Error ${res.status}: ${txt}`; }
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
-async function exportAny(){
+async function exportAny(targetFormat){
   const items = parseItems($items.value);
   if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan.'; return; }
+  const format = targetFormat === 'kmz' ? 'kmz' : 'tiff';
   const body = {
-    format: $fmt.value,
-    max_px: parseInt($max.value || '4096', 10),
-    simplify_tolerance: parseFloat($simp.value || '0') || 0,
+    format,
+    max_px: DEFAULT_MAX_PX,
+    simplify_tolerance: DEFAULT_SIMPLIFY,
     include_veg_tiff: true, include_veg_kmz: true,
     veg_service_url: '%VEG_URL%', veg_layer_id: %VEG_LAYER%,
     veg_name_field: '%VEG_NAME%', veg_code_field: '%VEG_CODE%',
   };
   const name = normText($name.value) || null;
   if (items.length === 1){ body.lotplan = items[0]; if (name) body.filename = name; } else { body.lotplans = items; if (name) body.filename_prefix = name; }
-  $out.textContent = items.length === 1 ? 'Exporting…' : `Exporting ${items.length} items…`;
+  const label = format === 'kmz' ? 'KMZ' : 'GeoTIFF';
+  $out.textContent = items.length === 1 ? `Exporting ${label}…` : `Exporting ${label} for ${items.length} items…`;
   try{
     const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const disp = res.headers.get('content-disposition') || '';
@@ -246,9 +287,10 @@ async function exportAny(){
 $items.addEventListener('input', updateMode);
 $items.addEventListener('keyup', updateMode);
 $items.addEventListener('change', updateMode);
-document.getElementById('btn-load').addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
-document.getElementById('btn-json').addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
-document.getElementById('btn-export').addEventListener('click', (e)=>{ e.preventDefault(); exportAny(); });
+$btnLoad.addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
+$btnJson.addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
+$btnExportTiff.addEventListener('click', (e)=>{ e.preventDefault(); exportAny('tiff'); });
+$btnExportKmz.addEventListener('click', (e)=>{ e.preventDefault(); exportAny('kmz'); });
 updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
 </body></html>"""
@@ -301,15 +343,28 @@ def vector_geojson(lotplan: str = Query(...)):
     if not clipped:
         return JSONResponse({"error": "No Land Types intersect this parcel."}, status_code=404)
 
+    for feature in parcel_fc.get("features", []):
+        props = feature.get("properties") or {}
+        if props.get("lotplan") == lotplan:
+            continue
+        new_props = dict(props)
+        new_props["lotplan"] = lotplan
+        feature["properties"] = new_props
+
     features = []
     legend_map = {}
-    from shapely.geometry import mapping as shp_mapping
     for geom4326, code, name, area_ha in clipped:
         color_hex = _hex(color_from_code(code))
         features.append({
             "type": "Feature",
             "geometry": shp_mapping(geom4326),
-            "properties": {"code": code, "name": name, "area_ha": float(area_ha), "color_hex": color_hex}
+            "properties": {
+                "code": code,
+                "name": name,
+                "area_ha": float(area_ha),
+                "color_hex": color_hex,
+                "lotplan": lotplan,
+            },
         })
         legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
         legend_map[code]["area_ha"] += float(area_ha)
@@ -325,6 +380,109 @@ def vector_geojson(lotplan: str = Query(...)):
         "landtypes": { "type":"FeatureCollection", "features": features },
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": {"west": west, "south": south, "east": east, "north": north}
+    })
+
+
+class VectorBulkRequest(BaseModel):
+    lotplans: List[str] = Field(..., min_length=1)
+
+
+@app.post("/vector/bulk")
+def vector_geojson_bulk(payload: VectorBulkRequest):
+    seen = set()
+    lotplans: List[str] = []
+    for raw in payload.lotplans or []:
+        code = (raw or "").strip()
+        if not code:
+            continue
+        lp = normalize_lotplan(code)
+        if lp in seen:
+            continue
+        seen.add(lp)
+        lotplans.append(lp)
+
+    if not lotplans:
+        raise HTTPException(status_code=400, detail="No valid lot/plan codes provided.")
+
+    parcel_features: List[Dict[str, Any]] = []
+    landtype_features: List[Dict[str, Any]] = []
+    legend_map: Dict[str, Dict[str, Any]] = {}
+    bounds = None
+
+    def expand_bounds(current, geom):
+        if geom.is_empty:
+            return current
+        minx, miny, maxx, maxy = geom.bounds
+        if current is None:
+            return [minx, miny, maxx, maxy]
+        current[0] = min(current[0], minx)
+        current[1] = min(current[1], miny)
+        current[2] = max(current[2], maxx)
+        current[3] = max(current[3], maxy)
+        return current
+
+    for lotplan in lotplans:
+        parcel_fc = fetch_parcel_geojson(lotplan)
+        parcel_union = to_shapely_union(parcel_fc)
+        env = bbox_3857(parcel_union)
+
+        for feature in parcel_fc.get("features", []):
+            try:
+                geom = shp_shape(feature.get("geometry"))
+            except Exception:
+                continue
+            if geom.is_empty:
+                continue
+            bounds = expand_bounds(bounds, geom)
+            props = dict(feature.get("properties") or {})
+            props["lotplan"] = lotplan
+            parcel_features.append({
+                "type": "Feature",
+                "geometry": shp_mapping(geom),
+                "properties": props,
+            })
+
+        lt_fc = fetch_landtypes_intersecting_envelope(env)
+        clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+
+        for geom4326, code, name, area_ha in clipped:
+            if geom4326.is_empty:
+                continue
+            bounds = expand_bounds(bounds, geom4326)
+            color_hex = _hex(color_from_code(code))
+            landtype_features.append({
+                "type": "Feature",
+                "geometry": shp_mapping(geom4326),
+                "properties": {
+                    "code": code,
+                    "name": name,
+                    "area_ha": float(area_ha),
+                    "color_hex": color_hex,
+                    "lotplan": lotplan,
+                },
+            })
+            legend_map.setdefault(code, {
+                "code": code,
+                "name": name,
+                "color_hex": color_hex,
+                "area_ha": 0.0,
+            })
+            legend_map[code]["area_ha"] += float(area_ha)
+
+    if not parcel_features and not landtype_features:
+        raise HTTPException(status_code=404, detail="No features found for the provided lots/plans.")
+
+    bounds_dict = None
+    if bounds is not None:
+        west, south, east, north = bounds
+        bounds_dict = {"west": west, "south": south, "east": east, "north": north}
+
+    return JSONResponse({
+        "lotplans": lotplans,
+        "parcels": {"type": "FeatureCollection", "features": parcel_features},
+        "landtypes": {"type": "FeatureCollection", "features": landtype_features},
+        "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
+        "bounds4326": bounds_dict,
     })
 
 @app.get("/export_kmz")
