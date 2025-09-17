@@ -3,11 +3,20 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 import requests
 
 from .config import (
+    BORE_DRILL_DATE_FIELD,
+    BORE_LAYER_ID,
+    BORE_NUMBER_FIELD,
+    BORE_REPORT_URL_FIELD,
+    BORE_SERVICE_URL,
+    BORE_STATUS_CODE_FIELD,
+    BORE_STATUS_LABEL_FIELD,
+    BORE_TYPE_CODE_FIELD,
+    BORE_TYPE_LABEL_FIELD,
     ARCGIS_MAX_RECORDS,
     ARCGIS_TIMEOUT,
     LANDTYPES_CODE_FIELD,
@@ -19,6 +28,12 @@ from .config import (
     PARCEL_LOTPLAN_FIELD,
     PARCEL_PLAN_FIELD,
     PARCEL_SERVICE_URL,
+)
+from .bores import (
+    get_bore_icon,
+    make_bore_icon_key,
+    normalize_bore_drill_date,
+    normalize_bore_number,
 )
 
 
@@ -66,6 +81,13 @@ def _arcgis_geojson_query(service_url: str, layer_id: int, params: Dict[str, Any
     return out_fc
 
 _LOTPLAN_RE = re.compile(r"^\s*(?:LOT\s*)?(\d+)\s*(?:PLAN\s*)?([A-Z]+[A-Z0-9]+)\s*$", re.IGNORECASE)
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
 
 def _parse_lotplan(lp: str):
     if not lp:
@@ -150,3 +172,81 @@ def fetch_features_intersecting_envelope(service_url: str, layer_id: int, env_38
         "outSR": out_sr,
     }
     return _arcgis_geojson_query(service_url, int(layer_id), params, paginate=True)
+
+
+def _join_fields(fields: Iterable[str]) -> str:
+    out: List[str] = []
+    seen = set()
+    for field in fields:
+        if not field:
+            continue
+        key = field.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return ",".join(out)
+
+
+def fetch_bores_intersecting_envelope(env_3857) -> Dict[str, Any]:
+    """Fetch bore features intersecting an envelope in EPSG:3857."""
+
+    if not BORE_SERVICE_URL or BORE_LAYER_ID < 0:
+        raise RuntimeError("Bore service not configured.")
+
+    out_fields = _join_fields(
+        [
+            BORE_NUMBER_FIELD,
+            BORE_STATUS_LABEL_FIELD,
+            BORE_STATUS_CODE_FIELD,
+            BORE_TYPE_LABEL_FIELD,
+            BORE_TYPE_CODE_FIELD,
+            BORE_DRILL_DATE_FIELD,
+            BORE_REPORT_URL_FIELD,
+        ]
+    )
+
+    fc = fetch_features_intersecting_envelope(
+        BORE_SERVICE_URL,
+        BORE_LAYER_ID,
+        env_3857,
+        out_sr=4326,
+        out_fields=out_fields,
+    )
+
+    features_out: List[Dict[str, Any]] = []
+    for feat in fc.get("features", []):
+        props = feat.get("properties") or {}
+        raw_number = props.get(BORE_NUMBER_FIELD)
+        bore_number = normalize_bore_number(raw_number)
+        if not bore_number:
+            continue
+
+        status_code = _clean_text(props.get(BORE_STATUS_CODE_FIELD))
+        type_code = _clean_text(props.get(BORE_TYPE_CODE_FIELD))
+        status_label = _clean_text(props.get(BORE_STATUS_LABEL_FIELD))
+        type_label = _clean_text(props.get(BORE_TYPE_LABEL_FIELD))
+        drilled_date = normalize_bore_drill_date(props.get(BORE_DRILL_DATE_FIELD))
+        report_url = _clean_text(props.get(BORE_REPORT_URL_FIELD))
+
+        icon = get_bore_icon(status_code, type_code)
+        icon_key = icon.key if icon and icon.key else make_bore_icon_key(status_code, type_code)
+
+        features_out.append(
+            {
+                "type": "Feature",
+                "geometry": feat.get("geometry"),
+                "properties": {
+                    "bore_number": bore_number,
+                    "status_label": status_label or None,
+                    "type_label": type_label or None,
+                    "status": status_code or None,
+                    "type": type_code or None,
+                    "drilled_date": drilled_date,
+                    "report_url": report_url or None,
+                    "icon_key": icon_key,
+                },
+            }
+        )
+
+    return {"type": "FeatureCollection", "features": features_out}
