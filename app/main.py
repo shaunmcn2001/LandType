@@ -9,9 +9,10 @@ import logging
 import os
 import tempfile
 import zipfile
+from dataclasses import replace
 from enum import Enum
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -162,6 +163,11 @@ _ICON_EXTENSIONS: Dict[str, str] = {
     "image/jpg": "jpg",
 }
 
+_EXT_CONTENT_TYPES: Dict[str, str] = {}
+for _mime, _ext in _ICON_EXTENSIONS.items():
+    if _ext:
+        _EXT_CONTENT_TYPES.setdefault(_ext.lower(), _mime)
+
 
 def _slugify_icon_key(icon_key: str) -> str:
     key = (icon_key or "").strip().lower().replace(",", "_")
@@ -172,6 +178,51 @@ def _icon_href_for_key(icon_key: str, content_type: Optional[str]) -> str:
     slug = _slugify_icon_key(icon_key)
     ext = _ICON_EXTENSIONS.get((content_type or "").lower(), "png")
     return f"icons/{slug}.{ext}"
+
+
+def _icon_content_type_from_href(icon_href: str) -> str:
+    _, ext = os.path.splitext(icon_href or "")
+    ext_clean = ext.lower().lstrip(".")
+    if ext_clean:
+        return _EXT_CONTENT_TYPES.get(ext_clean, "image/png")
+    return "image/png"
+
+
+def _data_uri_for_icon(icon_href: str, data: Optional[bytes]) -> Optional[str]:
+    if not data:
+        return None
+    try:
+        content_type = _icon_content_type_from_href(icon_href)
+        encoded = base64.b64encode(data).decode("ascii")
+    except Exception:
+        return None
+    return f"data:{content_type};base64,{encoded}"
+
+
+def _inline_point_icon_hrefs(
+    points: Sequence[PointPlacemark], assets: Mapping[str, bytes]
+) -> List[PointPlacemark]:
+    if not points:
+        return []
+    if not assets:
+        return list(points)
+
+    cache: Dict[str, Optional[str]] = {}
+    updated: List[PointPlacemark] = []
+    for point in points:
+        icon_href = point.icon_href
+        if not icon_href:
+            updated.append(point)
+            continue
+        if icon_href not in cache:
+            raw_data = assets.get(icon_href)
+            cache[icon_href] = _data_uri_for_icon(icon_href, raw_data)
+        data_uri = cache[icon_href]
+        if data_uri:
+            updated.append(replace(point, icon_href=data_uri))
+        else:
+            updated.append(point)
+    return updated
 
 
 def _format_bore_description(props: Dict[str, Any]) -> str:
@@ -953,6 +1004,9 @@ def export_kml(
         lt_clipped = _simp(lt_clipped)
         if veg_clipped:
             veg_clipped = _simp(veg_clipped)
+
+    if bore_points:
+        bore_points = _inline_point_icon_hrefs(bore_points, bore_assets)
 
     kml = _render_parcel_kml(lotplan, lt_clipped, veg_clipped, bore_points)
 
