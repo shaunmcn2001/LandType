@@ -1,6 +1,9 @@
 # app/main.py
+import base64
+import binascii
 import csv
 import datetime as dt
+import html
 import io
 import logging
 import os
@@ -8,7 +11,7 @@ import tempfile
 import zipfile
 from enum import Enum
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,14 +40,25 @@ from .config import (
     VEG_NAME_FIELD_DEFAULT,
     VEG_SERVICE_URL_DEFAULT,
 )
-from .bores import make_bore_icon_key, normalize_bore_drill_date, normalize_bore_number
+from .bores import (
+    get_bore_icon_by_key,
+    make_bore_icon_key,
+    normalize_bore_drill_date,
+    normalize_bore_number,
+)
 from .geometry import (
     bbox_3857,
     merge_clipped_shapes_across_lots,
     prepare_clipped_shapes,
     to_shapely_union,
 )
-from .kml import build_kml, build_kml_folders, build_kml_nested_folders, write_kmz
+from .kml import (
+    PointPlacemark,
+    build_kml,
+    build_kml_folders,
+    build_kml_nested_folders,
+    write_kmz,
+)
 from .raster import make_geotiff_rgba
 
 logging.basicConfig(level=logging.INFO)
@@ -139,6 +153,148 @@ def _normalize_bore_properties(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "report_url": _or_none(report_url),
         "icon_key": icon_key,
     }
+
+
+BORE_FOLDER_NAME = "Groundwater Bores"
+_ICON_EXTENSIONS: Dict[str, str] = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+}
+
+
+def _slugify_icon_key(icon_key: str) -> str:
+    key = (icon_key or "").strip().lower().replace(",", "_")
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in key) or "icon"
+
+
+def _icon_href_for_key(icon_key: str, content_type: Optional[str]) -> str:
+    slug = _slugify_icon_key(icon_key)
+    ext = _ICON_EXTENSIONS.get((content_type or "").lower(), "png")
+    return f"icons/{slug}.{ext}"
+
+
+def _format_bore_description(props: Dict[str, Any]) -> str:
+    def combine(label: Optional[str], code: Optional[str]) -> Optional[str]:
+        label_clean = (label or "").strip()
+        code_clean = (code or "").strip()
+        if label_clean and code_clean and label_clean.upper() != code_clean.upper():
+            return f"{label_clean} ({code_clean})"
+        return label_clean or code_clean or None
+
+    parts: List[str] = []
+    status_text = combine(props.get("status_label"), props.get("status"))
+    if status_text:
+        parts.append(f"<b>Status:</b> {html.escape(status_text)}")
+    type_text = combine(props.get("type_label"), props.get("type"))
+    if type_text:
+        parts.append(f"<b>Type:</b> {html.escape(type_text)}")
+    drilled = props.get("drilled_date")
+    if drilled:
+        parts.append(f"<b>Drilled:</b> {html.escape(str(drilled))}")
+    report_url = props.get("report_url")
+    if report_url:
+        safe_url = html.escape(str(report_url), quote=True)
+        parts.append(f'<a href="{safe_url}" target="_blank" rel="noopener">View bore report</a>')
+    return "<br/>".join(parts)
+
+
+def _prepare_bore_placemarks(
+    parcel_geom,
+    bore_fc: Dict[str, Any],
+) -> Tuple[List[PointPlacemark], Dict[str, bytes]]:
+    placemarks: List[PointPlacemark] = []
+    assets: Dict[str, bytes] = {}
+    seen_numbers: Set[str] = set()
+
+    for bore in bore_fc.get("features", []):
+        try:
+            geom = shp_shape(bore.get("geometry"))
+        except Exception:
+            continue
+        if geom.is_empty or geom.geom_type != "Point":
+            continue
+        if parcel_geom is not None:
+            try:
+                if not geom.intersects(parcel_geom):
+                    continue
+            except Exception:
+                pass
+        props = _normalize_bore_properties(bore.get("properties") or {})
+        if not props:
+            continue
+        bore_number = props.get("bore_number")
+        if not bore_number or bore_number in seen_numbers:
+            continue
+        seen_numbers.add(bore_number)
+
+        icon_key = props.get("icon_key")
+        style_id = None
+        icon_href = None
+        if icon_key:
+            icon_def = get_bore_icon_by_key(icon_key)
+            image_data = icon_def.image_data if icon_def else None
+            if image_data:
+                try:
+                    icon_bytes = base64.b64decode(image_data)
+                except (binascii.Error, ValueError):
+                    icon_bytes = None
+                if icon_bytes:
+                    icon_href = _icon_href_for_key(icon_key, icon_def.content_type if icon_def else None)
+                    assets.setdefault(icon_href, icon_bytes)
+                    style_id = f"bore_{_slugify_icon_key(icon_key)}"
+
+        description_html = _format_bore_description(props)
+        placemarks.append(
+            PointPlacemark(
+                name=bore_number,
+                description_html=description_html,
+                lon=float(geom.x),
+                lat=float(geom.y),
+                style_id=style_id,
+                icon_href=icon_href,
+            )
+        )
+
+    return placemarks, assets
+
+
+def _render_parcel_kml(
+    lotplan: str,
+    lt_clipped,
+    veg_clipped,
+    bore_points: Sequence[PointPlacemark],
+) -> str:
+    folder_name = f"QLD Land Types – {lotplan}"
+    if veg_clipped:
+        groups = [
+            (lt_clipped, color_from_code, f"Land Types – {lotplan}"),
+            (veg_clipped, color_from_code, f"Vegetation – {lotplan}"),
+        ]
+        if bore_points:
+            groups.append(([], color_from_code, BORE_FOLDER_NAME, list(bore_points)))
+        return build_kml_folders(groups, doc_name=f"QLD Export – {lotplan}")
+
+    if bore_points:
+        return build_kml(
+            lt_clipped,
+            color_fn=color_from_code,
+            folder_name=folder_name,
+            point_placemarks=list(bore_points),
+            point_folder_name=BORE_FOLDER_NAME,
+        )
+    return build_kml(lt_clipped, color_fn=color_from_code, folder_name=folder_name)
+
+
+def _kmz_bytes(kml_text: str, assets: Dict[str, bytes]) -> bytes:
+    mem = BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
+        ztmp.writestr("doc.kml", kml_text.encode("utf-8"))
+        for name, data in (assets or {}).items():
+            if not name or data is None:
+                continue
+            ztmp.writestr(name, data)
+    return mem.getvalue()
 
 @app.head("/")
 def home_head(): return Response(status_code=200)
@@ -701,8 +857,11 @@ def export_kmz(
     
     lt_fc = fetch_landtypes_intersecting_envelope(env)
     lt_clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-    if not lt_clipped: 
+    if not lt_clipped:
         raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+
+    bore_fc = fetch_bores_intersecting_envelope(env)
+    bore_points, _ = _prepare_bore_placemarks(parcel_union, bore_fc)
 
     veg_clipped = []
     if veg_service_url and veg_layer_id is not None:
@@ -732,20 +891,11 @@ def export_kmz(
         if veg_clipped:
             veg_clipped = _simp(veg_clipped)
 
-    if veg_clipped:
-        kml = build_kml_folders(
-            [
-                (lt_clipped, color_from_code, f"Land Types – {lotplan}"),
-                (veg_clipped, color_from_code, f"Vegetation – {lotplan}"),
-            ],
-            doc_name=f"QLD Export – {lotplan}",
-        )
-    else:
-        kml = build_kml(lt_clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lotplan}")
+    kml = _render_parcel_kml(lotplan, lt_clipped, veg_clipped, bore_points)
 
     tmpdir = tempfile.mkdtemp(prefix="kmz_")
     out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
-    write_kmz(kml, out_path)
+    write_kmz(kml, out_path, assets=bore_assets)
     data = open(out_path, "rb").read()
     os.remove(out_path); os.rmdir(tmpdir)
     return StreamingResponse(
@@ -773,6 +923,9 @@ def export_kml(
     if not lt_clipped:
         raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
 
+    bore_fc = fetch_bores_intersecting_envelope(env)
+    bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+
     veg_clipped = []
     if veg_service_url and veg_layer_id is not None:
         veg_fc = fetch_features_intersecting_envelope(
@@ -801,16 +954,7 @@ def export_kml(
         if veg_clipped:
             veg_clipped = _simp(veg_clipped)
 
-    if veg_clipped:
-        kml = build_kml_folders(
-            [
-                (lt_clipped, color_from_code, f"Land Types – {lotplan}"),
-                (veg_clipped, color_from_code, f"Vegetation – {lotplan}"),
-            ],
-            doc_name=f"QLD Export – {lotplan}",
-        )
-    else:
-        kml = build_kml(lt_clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lotplan}")
+    kml = _render_parcel_kml(lotplan, lt_clipped, veg_clipped, bore_points)
 
     filename = f"{lotplan}_landtypes" + ("_veg" if veg_clipped else "") + ".kml"
     return Response(
@@ -846,6 +990,9 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
     nested_groups = []
     all_lt_clipped = []  # Collect all land type data across lots
     all_veg_clipped = []  # Collect all vegetation data across lots
+    all_bore_points: List[PointPlacemark] = []
+    kmz_assets: Dict[str, bytes] = {}
+    seen_all_bores: Set[str] = set()
     
     for lp in items:
         try:
@@ -857,6 +1004,17 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
             thematic_fc = fetch_landtypes_intersecting_envelope(env)
             lt_clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
             
+            # Get bores
+            bore_fc = fetch_bores_intersecting_envelope(env)
+            bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+            for name, data in bore_assets.items():
+                if name not in kmz_assets:
+                    kmz_assets[name] = data
+            for point in bore_points:
+                if point.name and point.name not in seen_all_bores:
+                    seen_all_bores.add(point.name)
+                    all_bore_points.append(point)
+
             # Get vegetation
             veg_clipped = []
             if veg_url and veg_layer is not None:
@@ -889,14 +1047,16 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
                 all_lt_clipped.append(lt_clipped)
             if veg_clipped:
                 all_veg_clipped.append(veg_clipped)
-            
+
             # Create nested structure: lot folder with land types and veg subfolders
             subfolders = []
             if lt_clipped:
                 subfolders.append((lt_clipped, color_from_code, "Land Types"))
             if veg_clipped:
                 subfolders.append((veg_clipped, color_from_code, "Veg"))
-            
+            if bore_points:
+                subfolders.append(([], color_from_code, BORE_FOLDER_NAME, bore_points))
+
             if subfolders:
                 nested_groups.append((lp, subfolders))
                 
@@ -922,6 +1082,12 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
         if merged_veg:
             merged_folders.append(("Merged Vegetation (All Properties)", [(merged_veg, color_from_code, "Vegetation")]))
     
+    if all_bore_points:
+        merged_folders.append((
+            "Groundwater Bores (All Properties)",
+            [([], color_from_code, BORE_FOLDER_NAME, all_bore_points)],
+        ))
+
     # Combine merged folders with individual lot folders
     final_nested_groups = merged_folders + nested_groups
     
@@ -936,7 +1102,7 @@ def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Option
     tmpdir = tempfile.mkdtemp(prefix="bulk_kmz_")
     fname = f"{prefix+'_' if prefix else ''}bulk_export_{len(items)}_lots.kmz"
     out_path = os.path.join(tmpdir, fname)
-    write_kmz(kml, out_path)
+    write_kmz(kml, out_path, assets=kmz_assets)
     data = open(out_path, "rb").read()
     os.remove(out_path); os.rmdir(tmpdir)
     
@@ -1000,7 +1166,10 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             thematic_fc = fetch_landtypes_intersecting_envelope(env)
             lt_clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
             if not lt_clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-            
+
+            bore_fc = fetch_bores_intersecting_envelope(env)
+            bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+
             # Always include vegetation for single KMZ
             veg_clipped = []
             if veg_url and veg_layer is not None:
@@ -1024,17 +1193,11 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                     return out or data
                 lt_clipped = _simp(lt_clipped)
                 if veg_clipped: veg_clipped = _simp(veg_clipped)
-                
-            if veg_clipped:
-                kml = build_kml_folders([
-                    (lt_clipped, color_from_code, f"Land Types – {lp}"),
-                    (veg_clipped, color_from_code, f"Vegetation – {lp}"),
-                ], doc_name=f"QLD Export – {lp}")
-            else:
-                kml = build_kml(lt_clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lp}")
-                
+
+            kml = _render_parcel_kml(lp, lt_clipped, veg_clipped, bore_points)
+
             tmpdir = tempfile.mkdtemp(prefix="kmz_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.kmz")
-            write_kmz(kml, out_path); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
+            write_kmz(kml, out_path, assets=bore_assets); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
             fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
             if not fname.lower().endswith(".kmz"): fname += ".kmz"
             return StreamingResponse(
@@ -1064,6 +1227,8 @@ def export_any(payload: ExportAnyRequest = Body(...)):
             try:
                 thematic_fc = fetch_landtypes_intersecting_envelope(env)
                 clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
+                bore_fc = fetch_bores_intersecting_envelope(env)
+                bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
                 if clipped:
                     if payload.format in (FormatEnum.tiff, FormatEnum.both):
                         tmpdir = tempfile.mkdtemp(prefix="tif_"); path = os.path.join(tmpdir, f"{lp}_landtypes.tif")
@@ -1079,11 +1244,9 @@ def export_any(payload: ExportAnyRequest = Body(...)):
                                 g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
                                 if not g2.is_empty: simplified.append((g2, code, name, area_ha))
                             clipped = simplified or clipped
-                        kml = build_kml(clipped, color_fn=color_from_code, folder_name=f"QLD Land Types – {lp}")
-                        mem = BytesIO()
-                        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
-                            ztmp.writestr("doc.kml", kml.encode("utf-8"))
-                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz", mem.getvalue())
+                        kml = _render_parcel_kml(lp, clipped, [], bore_points)
+                        kmz_data = _kmz_bytes(kml, bore_assets)
+                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz", kmz_data)
                         row["status_kmz"]="ok"; row["file_kmz"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
                 else:
                     row["status_tiff"]="skip"; row["status_kmz"]="skip"; row["message"]="No Land Types intersect."
