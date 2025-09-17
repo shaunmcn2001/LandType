@@ -861,7 +861,7 @@ def export_kmz(
         raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
 
     bore_fc = fetch_bores_intersecting_envelope(env)
-    bore_points, _ = _prepare_bore_placemarks(parcel_union, bore_fc)
+    bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
 
     veg_clipped = []
     if veg_service_url and veg_layer_id is not None:
