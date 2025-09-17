@@ -8,7 +8,7 @@ import tempfile
 import zipfile
 from enum import Enum
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from shapely.geometry import mapping as shp_mapping, shape as shp_shape
 
 from .arcgis import (
+    fetch_bores_intersecting_envelope,
     fetch_features_intersecting_envelope,
     fetch_landtypes_intersecting_envelope,
     fetch_parcel_geojson,
@@ -24,11 +25,19 @@ from .arcgis import (
 )
 from .colors import color_from_code
 from .config import (
+    BORE_DRILL_DATE_FIELD,
+    BORE_NUMBER_FIELD,
+    BORE_REPORT_URL_FIELD,
+    BORE_STATUS_CODE_FIELD,
+    BORE_STATUS_LABEL_FIELD,
+    BORE_TYPE_CODE_FIELD,
+    BORE_TYPE_LABEL_FIELD,
     VEG_CODE_FIELD_DEFAULT,
     VEG_LAYER_ID_DEFAULT,
     VEG_NAME_FIELD_DEFAULT,
     VEG_SERVICE_URL_DEFAULT,
 )
+from .bores import make_bore_icon_key, normalize_bore_drill_date, normalize_bore_number
 from .geometry import (
     bbox_3857,
     merge_clipped_shapes_across_lots,
@@ -60,6 +69,76 @@ def _hex(rgb):
 def _sanitize_filename(s: Optional[str]) -> str:
     base = "".join(c for c in (s or "").strip() if c.isalnum() or c in ("_", "-", ".", " "))
     return (base or "download").strip()
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_bore_properties(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    props = raw or {}
+
+    bore_number = normalize_bore_number(
+        props.get("bore_number")
+        or props.get(BORE_NUMBER_FIELD)
+        or props.get("rn")
+        or props.get("rn_char")
+    )
+    if not bore_number:
+        return None
+
+    status_code = _clean_text(
+        props.get("status")
+        or props.get("status_code")
+        or props.get(BORE_STATUS_CODE_FIELD)
+        or props.get("facility_status")
+    )
+    status_label = _clean_text(
+        props.get("status_label")
+        or props.get(BORE_STATUS_LABEL_FIELD)
+        or props.get("statusLabel")
+        or props.get("facility_status_decode")
+    )
+
+    bore_type_code = _clean_text(
+        props.get("type")
+        or props.get("type_code")
+        or props.get(BORE_TYPE_CODE_FIELD)
+        or props.get("facility_type")
+    )
+    bore_type_label = _clean_text(
+        props.get("type_label")
+        or props.get(BORE_TYPE_LABEL_FIELD)
+        or props.get("typeLabel")
+        or props.get("facility_type_decode")
+    )
+
+    drilled_date = normalize_bore_drill_date(
+        props.get("drilled_date") or props.get(BORE_DRILL_DATE_FIELD)
+    )
+    report_url = _clean_text(
+        props.get("report_url") or props.get(BORE_REPORT_URL_FIELD)
+    )
+
+    icon_key = props.get("icon_key")
+    if not icon_key:
+        icon_key = make_bore_icon_key(status_code, bore_type_code)
+
+    def _or_none(value: str) -> Optional[str]:
+        return value or None
+
+    return {
+        "bore_number": bore_number,
+        "status": _or_none(status_code),
+        "status_label": _or_none(status_label) or _or_none(status_code),
+        "type": _or_none(bore_type_code),
+        "type_label": _or_none(bore_type_label) or _or_none(bore_type_code),
+        "drilled_date": drilled_date,
+        "report_url": _or_none(report_url),
+        "icon_key": icon_key,
+    }
 
 @app.head("/")
 def home_head(): return Response(status_code=200)
@@ -135,6 +214,34 @@ const $items = document.getElementById('items'),
 
 const DEFAULT_MAX_PX = 4096;
 const DEFAULT_SIMPLIFY = 0;
+const DEFAULT_BORE_COLOR = '#38bdf8';
+const BORE_STATUS_COLORS = {
+  EX: '#22c55e',
+  AU: '#2563eb',
+  AD: '#ef4444',
+  IN: '#f59e0b'
+};
+const ESCAPE_HTML_LOOKUP = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;"
+};
+
+function colorForBoreStatus(status){
+  const key = (status || '').toString().trim().toUpperCase();
+  return BORE_STATUS_COLORS[key] || DEFAULT_BORE_COLOR;
+}
+
+function boreClassName(key){
+  if (!key) return 'bore-marker';
+  return `bore-marker bore-${String(key).toLowerCase().replace(/[^a-z0-9]+/g,'-')}`;
+}
+
+function escHtml(value){
+  return (value == null ? '' : String(value)).replace(/[&<>"']/g, ch => ESCAPE_HTML_LOOKUP[ch] || ch);
+}
 
 function normText(s){ return (s || '').trim(); }
 function parseItems(text){
@@ -171,7 +278,7 @@ function updateMode(){
   }
 }
 
-let map=null, parcelLayer=null, ltLayer=null;
+let map=null, parcelLayer=null, ltLayer=null, boreLayer=null;
 function ensureMap(){
   try{
     if (map) return;
@@ -182,7 +289,13 @@ function ensureMap(){
   }catch(e){ console.warn('Map init failed:', e); }
 }
 function styleForCode(code, colorHex){ return { color:'#0c1325', weight:1, fillColor:colorHex, fillOpacity:0.6 }; }
-function clearLayers(){ try{ if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; } if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; } }catch{} }
+function clearLayers(){
+  try{
+    if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; }
+    if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; }
+    if(map && boreLayer){ map.removeLayer(boreLayer); boreLayer=null; }
+  }catch{}
+}
 function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
 
 async function loadVector(){
@@ -225,6 +338,37 @@ async function loadVector(){
           layer.bindPopup(html);
         }}).addTo(map);
     }
+    const boreData = data.bores;
+    if (boreData && Array.isArray(boreData.features) && boreData.features.length){
+      boreLayer = L.geoJSON(boreData, {
+        pointToLayer: (feature, latlng) => {
+          const props = feature.properties || {};
+          const color = colorForBoreStatus(props.status);
+          const cls = boreClassName(props.icon_key || props.status);
+          return L.circleMarker(latlng, {
+            radius: 6,
+            color,
+            weight: 1.5,
+            fillColor: color,
+            fillOpacity: 0.85,
+            className: cls
+          });
+        },
+        onEachFeature: (feature, layer) => {
+          const props = feature.properties || {};
+          const lines = [];
+          const num = props.bore_number || 'Unknown';
+          lines.push(`<strong>Bore ${escHtml(num)}</strong>`);
+          const statusText = props.status_label || props.status;
+          if (statusText){ lines.push(`<span class="muted">Status:</span> ${escHtml(statusText)}`); }
+          const typeText = props.type_label || props.type;
+          if (typeText){ lines.push(`<span class="muted">Type:</span> ${escHtml(typeText)}`); }
+          if (props.drilled_date){ lines.push(`<span class="muted">Drilled:</span> ${escHtml(props.drilled_date)}`); }
+          layer.bindPopup(lines.join('<br/>'));
+          if (props.bore_number){ layer.options.title = `Bore ${props.bore_number}`; }
+        }
+      }).addTo(map);
+    }
     const b = data.bounds4326;
     if (b){
       map.fitBounds([[b.south, b.west],[b.north, b.east]], { padding:[20,20] });
@@ -232,6 +376,8 @@ async function loadVector(){
       map.fitBounds(parcelLayer.getBounds(), { padding:[20,20] });
     } else if (ltLayer && ltLayer.getBounds){
       map.fitBounds(ltLayer.getBounds(), { padding:[20,20] });
+    } else if (boreLayer && boreLayer.getBounds){
+      map.fitBounds(boreLayer.getBounds(), { padding:[20,20] });
     }
     const summary = {
       lotplans: data.lotplans || (data.lotplan ? [data.lotplan] : []),
@@ -340,6 +486,7 @@ def vector_geojson(lotplan: str = Query(...)):
     env = bbox_3857(parcel_union)
     lt_fc = fetch_landtypes_intersecting_envelope(env)
     clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+    bore_fc = fetch_bores_intersecting_envelope(env)
     if not clipped:
         return JSONResponse({"error": "No Land Types intersect this parcel."}, status_code=404)
 
@@ -369,15 +516,42 @@ def vector_geojson(lotplan: str = Query(...)):
         legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
         legend_map[code]["area_ha"] += float(area_ha)
 
-    union_bounds = to_shapely_union({
-        "type":"FeatureCollection",
-        "features":[{"type":"Feature","geometry":f["geometry"],"properties":{}} for f in features]
-    }).bounds
-    west, south, east, north = union_bounds
+    bore_features: List[Dict[str, Any]] = []
+    seen_bores: Set[str] = set()
+    for bore in bore_fc.get("features", []):
+        try:
+            geom = shp_shape(bore.get("geometry"))
+        except Exception:
+            continue
+        if geom.is_empty:
+            continue
+        norm_props = _normalize_bore_properties(bore.get("properties") or {})
+        if not norm_props:
+            continue
+        bore_number = norm_props.get("bore_number")
+        if not bore_number or bore_number in seen_bores:
+            continue
+        seen_bores.add(bore_number)
+        norm_props["lotplan"] = lotplan
+        bore_features.append({
+            "type": "Feature",
+            "geometry": shp_mapping(geom),
+            "properties": norm_props,
+        })
+
+    bounds_fc = {"type": "FeatureCollection", "features": []}
+    bounds_fc["features"].extend(parcel_fc.get("features", []))
+    bounds_fc["features"].extend(features)
+    bounds_fc["features"].extend(bore_features)
+    bounds_geom = to_shapely_union(bounds_fc)
+    if bounds_geom.is_empty:
+        bounds_geom = parcel_union
+    west, south, east, north = bounds_geom.bounds
     return JSONResponse({
         "lotplan": lotplan,
         "parcel": parcel_fc,
         "landtypes": { "type":"FeatureCollection", "features": features },
+        "bores": {"type": "FeatureCollection", "features": bore_features},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": {"west": west, "south": south, "east": east, "north": north}
     })
@@ -406,8 +580,10 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
 
     parcel_features: List[Dict[str, Any]] = []
     landtype_features: List[Dict[str, Any]] = []
+    bore_features: List[Dict[str, Any]] = []
     legend_map: Dict[str, Dict[str, Any]] = {}
     bounds = None
+    seen_bore_numbers: Set[str] = set()
 
     def expand_bounds(current, geom):
         if geom.is_empty:
@@ -444,6 +620,29 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
 
         lt_fc = fetch_landtypes_intersecting_envelope(env)
         clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
+        bore_fc = fetch_bores_intersecting_envelope(env)
+
+        for bore in bore_fc.get("features", []):
+            try:
+                geom = shp_shape(bore.get("geometry"))
+            except Exception:
+                continue
+            if geom.is_empty:
+                continue
+            norm_props = _normalize_bore_properties(bore.get("properties") or {})
+            if not norm_props:
+                continue
+            bore_number = norm_props.get("bore_number")
+            if not bore_number or bore_number in seen_bore_numbers:
+                continue
+            seen_bore_numbers.add(bore_number)
+            norm_props["lotplan"] = lotplan
+            bore_features.append({
+                "type": "Feature",
+                "geometry": shp_mapping(geom),
+                "properties": norm_props,
+            })
+            bounds = expand_bounds(bounds, geom)
 
         for geom4326, code, name, area_ha in clipped:
             if geom4326.is_empty:
@@ -469,7 +668,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
             })
             legend_map[code]["area_ha"] += float(area_ha)
 
-    if not parcel_features and not landtype_features:
+    if not parcel_features and not landtype_features and not bore_features:
         raise HTTPException(status_code=404, detail="No features found for the provided lots/plans.")
 
     bounds_dict = None
@@ -481,6 +680,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
         "lotplans": lotplans,
         "parcels": {"type": "FeatureCollection", "features": parcel_features},
         "landtypes": {"type": "FeatureCollection", "features": landtype_features},
+        "bores": {"type": "FeatureCollection", "features": bore_features},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": bounds_dict,
     })
