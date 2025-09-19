@@ -10,10 +10,10 @@ import math
 import os
 import tempfile
 import zipfile
-from dataclasses import replace
-from enum import Enum
+from dataclasses import dataclass, replace
 from io import BytesIO
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from urllib.parse import quote
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,7 +57,6 @@ from .bores import (
 )
 from .geometry import (
     bbox_3857,
-    merge_clipped_shapes_across_lots,
     prepare_clipped_shapes,
     to_shapely_union,
 )
@@ -92,6 +91,14 @@ def _hex(rgb):
 def _sanitize_filename(s: Optional[str]) -> str:
     base = "".join(c for c in (s or "").strip() if c.isalnum() or c in ("_", "-", ".", " "))
     return (base or "download").strip()
+
+
+def _content_disposition(filename: str) -> str:
+    ascii_name = _sanitize_filename(filename.replace("–", "-") if filename else filename)
+    if not ascii_name:
+        ascii_name = "download"
+    encoded = quote(filename or "download", safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 def _clean_text(value: Any) -> str:
@@ -472,6 +479,182 @@ def _kmz_bytes(kml_text: str, assets: Dict[str, bytes]) -> bytes:
                 continue
             ztmp.writestr(name, data)
     return mem.getvalue()
+
+
+@dataclass(frozen=True)
+class PropertyReportKMZ:
+    lotplan: str
+    filename: str
+    kml_text: str
+    kmz_bytes: bytes
+    landtypes: Tuple[tuple, ...]
+    vegetation: Tuple[tuple, ...]
+    easements: Tuple[tuple, ...]
+    easement_color_map: Mapping[str, str]
+    bore_points: Tuple[PointPlacemark, ...]
+    bore_assets: Mapping[str, bytes]
+
+
+def _default_veg_config() -> Tuple[str, Optional[int], str, Optional[str]]:
+    veg_url = (VEG_SERVICE_URL_DEFAULT or "").strip()
+    veg_layer = VEG_LAYER_ID_DEFAULT
+    veg_name = (VEG_NAME_FIELD_DEFAULT or "").strip()
+    veg_code = (VEG_CODE_FIELD_DEFAULT or "").strip() or None
+    return veg_url, veg_layer, veg_name, veg_code
+
+
+def build_property_report_kmz(
+    lotplan: str,
+    *,
+    simplify_tolerance: float = 0.0,
+    veg_service_url: Optional[str] = None,
+    veg_layer_id: Optional[int] = None,
+    veg_name_field: Optional[str] = None,
+    veg_code_field: Optional[str] = None,
+) -> PropertyReportKMZ:
+    lotplan_norm = normalize_lotplan(lotplan)
+    if not lotplan_norm:
+        raise HTTPException(status_code=400, detail="Lotplan is required.")
+
+    parcel_fc = fetch_parcel_geojson(lotplan_norm)
+    parcel_union = to_shapely_union(parcel_fc)
+    env = bbox_3857(parcel_union)
+
+    thematic_fc = fetch_landtypes_intersecting_envelope(env)
+    lt_clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
+
+    bore_fc = fetch_bores_intersecting_envelope(env)
+    bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+
+    veg_url = (veg_service_url or "").strip()
+    veg_layer = veg_layer_id
+    veg_name = (veg_name_field or "").strip()
+    veg_code = (veg_code_field or "").strip() or None
+    if not veg_url or veg_layer is None or not veg_name:
+        veg_url, veg_layer, veg_name, veg_code = _default_veg_config()
+
+    veg_clipped: List[tuple] = []
+    if veg_url and veg_layer is not None and veg_name:
+        veg_fc = fetch_features_intersecting_envelope(
+            veg_url,
+            veg_layer,
+            env,
+            out_fields="*",
+        )
+        for feature in veg_fc.get("features", []):
+            props = feature.get("properties") or {}
+            code = str(props.get(veg_code or "code") or props.get("code") or "").strip()
+            name = str(props.get(veg_name or "name") or props.get("name") or code).strip()
+            props["code"] = code or name or "UNK"
+            category_name = name or code or "Unknown"
+            props["name"] = f"Category {category_name}"
+        veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
+
+    easement_fc = fetch_easements_intersecting_envelope(env)
+    easement_features: List[Dict[str, Any]] = []
+    easement_color_lookup: Dict[str, str] = {}
+    for feature in (easement_fc or {}).get("features", []):
+        geometry = feature.get("geometry")
+        if not geometry:
+            continue
+        props = _normalize_easement_properties(feature.get("properties") or {}, lotplan_norm)
+        owner_lp = props.get("lotplan") or lotplan_norm
+        parcel_type = props.get("parcel_type") or ""
+        tenure = props.get("tenure") or ""
+        alias = props.get("alias")
+        display_name = props.get("name") or alias or "Easement"
+        desc_parts = [f"Lot/Plan: {owner_lp}"]
+        desc_parts.append(f"Parcel Type: {parcel_type or '-'}")
+        desc_parts.append(f"Tenure: {tenure or '-'}")
+        desc_parts.append(f"Alias: {alias or '-'}")
+        code_text = " | ".join(desc_parts)
+        color_key = parcel_type or tenure or owner_lp or "Easement"
+        easement_color_lookup[code_text] = color_key
+        easement_features.append(
+            {
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": {
+                    "code": code_text,
+                    "name": display_name,
+                },
+            }
+        )
+
+    easement_clipped = prepare_clipped_shapes(
+        parcel_fc,
+        {"type": "FeatureCollection", "features": easement_features},
+    )
+
+    if simplify_tolerance and simplify_tolerance > 0:
+        def _simplify(data: Iterable[tuple]) -> Tuple[tuple, ...]:
+            simplified: List[tuple] = []
+            for geom4326, code, name, area_ha in data:
+                try:
+                    g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
+                except Exception:
+                    g2 = geom4326
+                if g2.is_empty:
+                    continue
+                simplified.append((g2, code, name, area_ha))
+            return tuple(simplified) if simplified else tuple(data)
+
+        lt_clipped = list(_simplify(lt_clipped))
+        if veg_clipped:
+            veg_clipped = list(_simplify(veg_clipped))
+        if easement_clipped:
+            easement_clipped = list(_simplify(easement_clipped))
+
+    def _easement_color_fn(code: str) -> Tuple[int, int, int]:
+        base = easement_color_lookup.get(code, code)
+        return color_from_code(base)
+
+    groups = []
+    if lt_clipped:
+        groups.append((lt_clipped, color_from_code, "Land Types"))
+    if veg_clipped:
+        groups.append((veg_clipped, color_from_code, "Vegetation"))
+    if easement_clipped:
+        groups.append((easement_clipped, _easement_color_fn, "Easements"))
+    if bore_points:
+        groups.append(([], color_from_code, BORE_FOLDER_NAME, list(bore_points)))
+
+    doc_name = f"Property Report – {lotplan_norm}"
+    kml_text = build_kml_folders(groups, doc_name=doc_name)
+
+    if not (lt_clipped or veg_clipped or easement_clipped or bore_points):
+        raise HTTPException(status_code=404, detail="No features intersect this parcel.")
+
+    tmpdir = tempfile.mkdtemp(prefix="kmz_")
+    filename = f"Property Report – {lotplan_norm}.kmz"
+    out_path = os.path.join(tmpdir, filename)
+    try:
+        write_kmz(kml_text, out_path, assets=bore_assets)
+        with open(out_path, "rb") as fh:
+            kmz_bytes = fh.read()
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    return PropertyReportKMZ(
+        lotplan=lotplan_norm,
+        filename=filename,
+        kml_text=kml_text,
+        kmz_bytes=kmz_bytes,
+        landtypes=tuple(lt_clipped or []),
+        vegetation=tuple(veg_clipped or []),
+        easements=tuple(easement_clipped or []),
+        easement_color_map=dict(easement_color_lookup),
+        bore_points=tuple(bore_points),
+        bore_assets=dict(bore_assets),
+    )
 
 @app.head("/")
 def home_head(): return Response(status_code=200)
@@ -1110,58 +1293,19 @@ def export_kmz(
     veg_name_field: Optional[str] = Query(VEG_NAME_FIELD_DEFAULT, alias="veg_name"),
     veg_code_field: Optional[str] = Query(VEG_CODE_FIELD_DEFAULT, alias="veg_code"),
 ):
-    lotplan = normalize_lotplan(lotplan)
-    parcel_fc = fetch_parcel_geojson(lotplan)
-    parcel_union = to_shapely_union(parcel_fc)
-    env = bbox_3857(parcel_union)
-    
-    lt_fc = fetch_landtypes_intersecting_envelope(env)
-    lt_clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
-    if not lt_clipped:
-        raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+    report = build_property_report_kmz(
+        lotplan,
+        simplify_tolerance=simplify_tolerance,
+        veg_service_url=veg_service_url,
+        veg_layer_id=veg_layer_id,
+        veg_name_field=veg_name_field,
+        veg_code_field=veg_code_field,
+    )
 
-    bore_fc = fetch_bores_intersecting_envelope(env)
-    bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
-
-    veg_clipped = []
-    if veg_service_url and veg_layer_id is not None:
-        veg_fc = fetch_features_intersecting_envelope(
-            veg_service_url, veg_layer_id, env, out_fields="*"
-        )
-        # standardise fields
-        for f in veg_fc.get("features", []):
-            props = f.get("properties") or {}
-            code = str(props.get(veg_code_field or "code") or props.get("code") or "").strip()
-            name = str(props.get(veg_name_field or "name") or props.get("name") or code).strip()
-            props["code"] = code or name or "UNK"
-            # Format vegetation names as "Category *"
-            category_name = name or code or "Unknown"
-            props["name"] = f"Category {category_name}"
-        veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-
-    if simplify_tolerance and simplify_tolerance > 0:
-        def _simp(data):
-            out = []
-            for geom4326, code, name, area_ha in data:
-                g2 = geom4326.simplify(simplify_tolerance, preserve_topology=True)
-                if not g2.is_empty:
-                    out.append((g2, code, name, area_ha))
-            return out or data
-        lt_clipped = _simp(lt_clipped)
-        if veg_clipped:
-            veg_clipped = _simp(veg_clipped)
-
-    kml = _render_parcel_kml(lotplan, lt_clipped, veg_clipped, bore_points)
-
-    tmpdir = tempfile.mkdtemp(prefix="kmz_")
-    out_path = os.path.join(tmpdir, f"{lotplan}_landtypes.kmz")
-    write_kmz(kml, out_path, assets=bore_assets)
-    data = open(out_path, "rb").read()
-    os.remove(out_path); os.rmdir(tmpdir)
     return StreamingResponse(
-        BytesIO(data),
+        BytesIO(report.kmz_bytes),
         media_type="application/vnd.google-earth.kmz",
-        headers={"Content-Disposition": f'attachment; filename="{lotplan}_landtypes.kmz"'},
+        headers={"Content-Disposition": _content_disposition(report.filename)},
     )
 
 @app.get("/export_kml")
@@ -1226,353 +1370,210 @@ def export_kml(
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-class FormatEnum(str, Enum):
-    tiff = "tiff"
-    kmz = "kmz"
-    both = "both"
-
 class ExportAnyRequest(BaseModel):
     lotplan: Optional[str] = Field(None)
     lotplans: Optional[List[str]] = Field(None)
-    max_px: int = Field(4096, ge=256, le=8192)
-    format: FormatEnum = Field(FormatEnum.tiff)
     filename: Optional[str] = Field(None)
     filename_prefix: Optional[str] = Field(None)
     simplify_tolerance: float = Field(0.0, ge=0.0, le=0.001)
-    include_veg_tiff: bool = False
-    include_veg_kmz: bool = False
-    veg_service_url: Optional[str] = None
-    veg_layer_id: Optional[int] = None
-    veg_name_field: Optional[str] = None
-    veg_code_field: Optional[str] = None
 
-def _create_bulk_kmz(items: List[str], payload: ExportAnyRequest, prefix: Optional[str], 
-                     veg_url: str, veg_layer: int, veg_name: str, veg_code: Optional[str]):
-    """Create a single KMZ file containing folders for each lot/plan with nested land types and vegetation."""
-    
+
+def _prefixed_report_filename(lotplan: str, prefix: Optional[str]) -> str:
+    base = f"Property Report – {lotplan}.kmz"
+    if not prefix:
+        return base
+    clean = _sanitize_filename(prefix)
+    if not clean:
+        return base
+    if clean.lower().endswith(".kmz"):
+        clean = clean[:-4]
+    return f"{clean} – {base}"
+
+
+def _create_bulk_kmz(
+    items: Sequence[str],
+    *,
+    simplify_tolerance: float,
+    veg_service_url: Optional[str],
+    veg_layer_id: Optional[int],
+    veg_name_field: Optional[str],
+    veg_code_field: Optional[str],
+    filename: Optional[str] = None,
+) -> StreamingResponse:
     nested_groups = []
-    all_lt_clipped = []  # Collect all land type data across lots
-    all_veg_clipped = []  # Collect all vegetation data across lots
-    all_bore_points: List[PointPlacemark] = []
     kmz_assets: Dict[str, bytes] = {}
-    seen_all_bores: Set[str] = set()
-    
+
     for lp in items:
-        try:
-            parcel_fc = fetch_parcel_geojson(lp)
-            parcel_union = to_shapely_union(parcel_fc)
-            env = bbox_3857(parcel_union)
-            
-            # Get land types
-            thematic_fc = fetch_landtypes_intersecting_envelope(env)
-            lt_clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
-            
-            # Get bores
-            bore_fc = fetch_bores_intersecting_envelope(env)
-            bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
-            for name, data in bore_assets.items():
-                if name not in kmz_assets:
-                    kmz_assets[name] = data
-            for point in bore_points:
-                if point.name and point.name not in seen_all_bores:
-                    seen_all_bores.add(point.name)
-                    all_bore_points.append(point)
+        report = build_property_report_kmz(
+            lp,
+            simplify_tolerance=simplify_tolerance,
+            veg_service_url=veg_service_url,
+            veg_layer_id=veg_layer_id,
+            veg_name_field=veg_name_field,
+            veg_code_field=veg_code_field,
+        )
 
-            # Get vegetation
-            veg_clipped = []
-            if veg_url and veg_layer is not None:
-                veg_fc = fetch_features_intersecting_envelope(veg_url, veg_layer, env, out_fields="*")
-                for f in veg_fc.get("features", []):
-                    props = f.get("properties") or {}
-                    code = str(props.get(veg_code or "code") or props.get("code") or "").strip()
-                    name = str(props.get(veg_name or "name") or props.get("name") or code).strip()
-                    props["code"] = code or name or "UNK"
-                    # Format vegetation names as "Category *"
-                    category_name = name or code or "Unknown"
-                    props["name"] = f"Category {category_name}"
-                veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-            
-            # Apply simplification if requested
-            if payload.simplify_tolerance and payload.simplify_tolerance > 0:
-                def _simp(data):
-                    out = []
-                    for geom4326, code, name, area_ha in data:
-                        g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
-                        if not g2.is_empty:
-                            out.append((g2, code, name, area_ha))
-                    return out or data
-                lt_clipped = _simp(lt_clipped)
-                if veg_clipped:
-                    veg_clipped = _simp(veg_clipped)
-            
-            # Store data for merging across lots
-            if lt_clipped:
-                all_lt_clipped.append(lt_clipped)
-            if veg_clipped:
-                all_veg_clipped.append(veg_clipped)
+        subgroups: List[Tuple[Iterable, Any, str]] = []
+        if report.landtypes:
+            subgroups.append((report.landtypes, color_from_code, "Land Types"))
+        if report.vegetation:
+            subgroups.append((report.vegetation, color_from_code, "Vegetation"))
+        if report.easements:
+            mapping = dict(report.easement_color_map)
 
-            # Create nested structure: lot folder with land types and veg subfolders
-            subfolders = []
-            if lt_clipped:
-                subfolders.append((lt_clipped, color_from_code, "Land Types"))
-            if veg_clipped:
-                subfolders.append((veg_clipped, color_from_code, "Veg"))
-            if bore_points:
-                subfolders.append(([], color_from_code, BORE_FOLDER_NAME, bore_points))
+            def _color_fn(code: str, _mapping=mapping) -> Tuple[int, int, int]:
+                base = _mapping.get(code, code)
+                return color_from_code(base)
 
-            if subfolders:
-                nested_groups.append((lp, subfolders))
-                
-        except Exception:
-            # Skip lots that fail to process
-            continue
-    
+            subgroups.append((report.easements, _color_fn, "Easements"))
+        if report.bore_points:
+            subgroups.append(([], color_from_code, BORE_FOLDER_NAME, list(report.bore_points)))
+
+        nested_groups.append((report.lotplan, subgroups))
+
+        for name, data in report.bore_assets.items():
+            if name not in kmz_assets:
+                kmz_assets[name] = data
+
     if not nested_groups:
-        raise HTTPException(status_code=404, detail="No data found for any of the provided lot/plans.")
-    
-    # Create merged layers across all lots
-    merged_folders = []
-    
-    # Merge land types across all lots
-    if all_lt_clipped:
-        merged_lt = merge_clipped_shapes_across_lots(all_lt_clipped)
-        if merged_lt:
-            merged_folders.append(("Merged Land Types (All Properties)", [(merged_lt, color_from_code, "Land Types")]))
-    
-    # Merge vegetation across all lots
-    if all_veg_clipped:
-        merged_veg = merge_clipped_shapes_across_lots(all_veg_clipped)
-        if merged_veg:
-            merged_folders.append(("Merged Vegetation (All Properties)", [(merged_veg, color_from_code, "Vegetation")]))
-    
-    if all_bore_points:
-        merged_folders.append((
-            "Groundwater Bores (All Properties)",
-            [([], color_from_code, BORE_FOLDER_NAME, all_bore_points)],
-        ))
+        raise HTTPException(status_code=404, detail="No data found for the provided lots/plans.")
 
-    # Combine merged folders with individual lot folders
-    final_nested_groups = merged_folders + nested_groups
-    
-    # Create KML with nested folder structure
-    doc_name = f"QLD Bulk Export – {len(items)} lots"
-    if prefix:
-        doc_name = f"{prefix} – {doc_name}"
-        
-    kml = build_kml_nested_folders(final_nested_groups, doc_name=doc_name)
-    
-    # Create KMZ file
-    tmpdir = tempfile.mkdtemp(prefix="bulk_kmz_")
-    fname = f"{prefix+'_' if prefix else ''}bulk_export_{len(items)}_lots.kmz"
-    out_path = os.path.join(tmpdir, fname)
-    write_kmz(kml, out_path, assets=kmz_assets)
-    data = open(out_path, "rb").read()
-    os.remove(out_path); os.rmdir(tmpdir)
-    
+    doc_label = _sanitize_filename(filename) if filename else None
+    if doc_label:
+        if doc_label.lower().endswith(".kmz"):
+            doc_label = doc_label[:-4]
+        if "Property Report" not in doc_label:
+            doc_label = f"Property Report – {doc_label}"
+    else:
+        doc_label = f"Property Report – {len(items)} lots"
+
+    kml = build_kml_nested_folders(nested_groups, doc_name=doc_label)
+
+    tmpdir = tempfile.mkdtemp(prefix="kmz_")
+    download_name = doc_label
+    out_path = os.path.join(tmpdir, f"{download_name}.kmz")
+    try:
+        write_kmz(kml, out_path, assets=kmz_assets)
+        with open(out_path, "rb") as fh:
+            kmz_bytes = fh.read()
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
     return StreamingResponse(
-        BytesIO(data),
+        BytesIO(kmz_bytes),
         media_type="application/vnd.google-earth.kmz",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": _content_disposition(f"{download_name}.kmz")},
     )
+
+
+def _create_property_report_zip(
+    items: Sequence[str],
+    *,
+    simplify_tolerance: float,
+    veg_service_url: Optional[str],
+    veg_layer_id: Optional[int],
+    veg_name_field: Optional[str],
+    veg_code_field: Optional[str],
+    filename_prefix: Optional[str] = None,
+) -> StreamingResponse:
+    reports: List[PropertyReportKMZ] = []
+    for lp in items:
+        report = build_property_report_kmz(
+            lp,
+            simplify_tolerance=simplify_tolerance,
+            veg_service_url=veg_service_url,
+            veg_layer_id=veg_layer_id,
+            veg_name_field=veg_name_field,
+            veg_code_field=veg_code_field,
+        )
+        reports.append(report)
+
+    zip_buf = BytesIO()
+    prefix_clean = _sanitize_filename(filename_prefix) if filename_prefix else None
+
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for report in reports:
+            entry_name = report.filename
+            if prefix_clean:
+                entry_name = _prefixed_report_filename(report.lotplan, prefix_clean)
+            zf.writestr(entry_name, report.kmz_bytes)
+
+    zip_buf.seek(0)
+    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    base_name = prefix_clean or "Property Reports"
+    zip_name = f"{base_name}_{stamp}.zip"
+
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": _content_disposition(zip_name)},
+    )
+
 
 @app.post("/export/any")
 def export_any(payload: ExportAnyRequest = Body(...)):
     items: List[str] = []
     if payload.lotplans:
-        seen = set()
-        for lp in (normalize_lotplan(lp) for lp in payload.lotplans):
-            if not lp: continue
-            if lp in seen: continue
-            seen.add(lp); items.append(lp)
-    if payload.lotplan:
-        lp = normalize_lotplan(payload.lotplan)
-        if lp and lp not in items:
+        seen: Set[str] = set()
+        for candidate in payload.lotplans:
+            lp = normalize_lotplan(candidate)
+            if not lp or lp in seen:
+                continue
+            seen.add(lp)
             items.append(lp)
-    if not items: raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
+    if payload.lotplan:
+        lp_single = normalize_lotplan(payload.lotplan)
+        if lp_single and lp_single not in items:
+            items.append(lp_single)
 
-    # Always include vegetation
-    veg_url = (payload.veg_service_url or VEG_SERVICE_URL_DEFAULT or "").strip()
-    veg_layer = payload.veg_layer_id if payload.veg_layer_id is not None else VEG_LAYER_ID_DEFAULT
-    veg_name = (payload.veg_name_field or VEG_NAME_FIELD_DEFAULT or "").strip()
-    veg_code = (payload.veg_code_field or VEG_CODE_FIELD_DEFAULT or "").strip() or None
-    if not veg_url or veg_layer is None or not veg_name:
-        raise HTTPException(status_code=400, detail="Vegetation service configuration missing.")
+    if not items:
+        raise HTTPException(status_code=400, detail="Provide lotplan or lotplans.")
 
-    prefix = _sanitize_filename(payload.filename_prefix) if payload.filename_prefix else None
-    
-    # For bulk KMZ exports, create a single KMZ with nested folders
-    if len(items) > 1 and payload.format == FormatEnum.kmz:
-        return _create_bulk_kmz(items, payload, prefix, veg_url, veg_layer, veg_name, veg_code)
-    
-    # For single item or other formats, use existing logic but always include vegetation
-    multi_files = (len(items) > 1) or (payload.format == FormatEnum.both) or payload.include_veg_tiff or payload.include_veg_kmz
+    simplify = payload.simplify_tolerance or 0.0
+    veg_url, veg_layer, veg_name, veg_code = _default_veg_config()
 
-    if not multi_files:
-        lp = items[0]
-        if payload.format == FormatEnum.tiff:
-            parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
-            thematic_fc = fetch_landtypes_intersecting_envelope(env)
-            clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
-            if not clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
-            tmpdir = tempfile.mkdtemp(prefix="tif_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.tif")
-            _ = make_geotiff_rgba(clipped, out_path, max_px=payload.max_px)
-            data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
-            fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
-            if not fname.lower().endswith(".tif"): fname += ".tif"
-            return StreamingResponse(
-                BytesIO(data),
-                media_type="image/tiff",
-                headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-            )
-        elif payload.format == FormatEnum.kmz:
-            parcel_fc = fetch_parcel_geojson(lp); parcel_union = to_shapely_union(parcel_fc); env = bbox_3857(parcel_union)
-            thematic_fc = fetch_landtypes_intersecting_envelope(env)
-            lt_clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
-            if not lt_clipped: raise HTTPException(status_code=404, detail="No Land Types intersect this parcel.")
+    if len(items) == 1:
+        report = build_property_report_kmz(
+            items[0],
+            simplify_tolerance=simplify,
+            veg_service_url=veg_url,
+            veg_layer_id=veg_layer,
+            veg_name_field=veg_name,
+            veg_code_field=veg_code,
+        )
+        prefix = _sanitize_filename(payload.filename) if payload.filename else None
+        download_name = _prefixed_report_filename(report.lotplan, prefix)
+        return StreamingResponse(
+            BytesIO(report.kmz_bytes),
+            media_type="application/vnd.google-earth.kmz",
+            headers={"Content-Disposition": _content_disposition(download_name)},
+        )
 
-            bore_fc = fetch_bores_intersecting_envelope(env)
-            bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+    if payload.filename_prefix:
+        return _create_property_report_zip(
+            items,
+            simplify_tolerance=simplify,
+            veg_service_url=veg_url,
+            veg_layer_id=veg_layer,
+            veg_name_field=veg_name,
+            veg_code_field=veg_code,
+            filename_prefix=payload.filename_prefix,
+        )
 
-            # Always include vegetation for single KMZ
-            veg_clipped = []
-            if veg_url and veg_layer is not None:
-                veg_fc = fetch_features_intersecting_envelope(veg_url, veg_layer, env, out_fields="*")
-                for f in veg_fc.get("features", []):
-                    props = f.get("properties") or {}
-                    code = str(props.get(veg_code or "code") or props.get("code") or "").strip()
-                    name = str(props.get(veg_name or "name") or props.get("name") or code).strip()
-                    props["code"] = code or name or "UNK"
-                    # Format vegetation names as "Category *"
-                    category_name = name or code or "Unknown"
-                    props["name"] = f"Category {category_name}"
-                veg_clipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-                
-            if payload.simplify_tolerance and payload.simplify_tolerance > 0:
-                def _simp(data):
-                    out = []
-                    for geom4326, code, name, area_ha in data:
-                        g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
-                        if not g2.is_empty: out.append((g2, code, name, area_ha))
-                    return out or data
-                lt_clipped = _simp(lt_clipped)
-                if veg_clipped: veg_clipped = _simp(veg_clipped)
-
-            kml = _render_parcel_kml(lp, lt_clipped, veg_clipped, bore_points)
-
-            tmpdir = tempfile.mkdtemp(prefix="kmz_"); out_path = os.path.join(tmpdir, f"{lp}_landtypes.kmz")
-            write_kmz(kml, out_path, assets=bore_assets); data = open(out_path, "rb").read(); os.remove(out_path); os.rmdir(tmpdir)
-            fname = _sanitize_filename(payload.filename) if payload.filename else f"{lp}_landtypes"
-            if not fname.lower().endswith(".kmz"): fname += ".kmz"
-            return StreamingResponse(
-                BytesIO(data),
-                media_type="application/vnd.google-earth.kmz",
-                headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-            )
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported format.")
-
-    # multi/zip
-    zip_buf = BytesIO()
-    manifest_rows: List[Dict[str, Any]] = []
-
-    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for lp in items:
-            row: Dict[str, Any] = {"lotplan": lp}
-            try:
-                parcel_fc = fetch_parcel_geojson(lp)
-                parcel_union = to_shapely_union(parcel_fc)
-                env = bbox_3857(parcel_union)
-            except Exception as e:
-                row.update({"status": "error:parcel", "message": str(e)})
-                manifest_rows.append(row); continue
-
-            # Land Types
-            try:
-                thematic_fc = fetch_landtypes_intersecting_envelope(env)
-                clipped = prepare_clipped_shapes(parcel_fc, thematic_fc)
-                bore_fc = fetch_bores_intersecting_envelope(env)
-                bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
-                if clipped:
-                    if payload.format in (FormatEnum.tiff, FormatEnum.both):
-                        tmpdir = tempfile.mkdtemp(prefix="tif_"); path = os.path.join(tmpdir, f"{lp}_landtypes.tif")
-                        _ = make_geotiff_rgba(clipped, path, max_px=payload.max_px)
-                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif", open(path,"rb").read())
-                        try: os.remove(path); os.rmdir(tmpdir)
-                        except Exception: pass
-                        row["status_tiff"]="ok"; row["file_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.tif"
-                    if payload.format in (FormatEnum.kmz, FormatEnum.both):
-                        if payload.simplify_tolerance and payload.simplify_tolerance > 0:
-                            simplified = []
-                            for geom4326, code, name, area_ha in clipped:
-                                g2 = geom4326.simplify(payload.simplify_tolerance, preserve_topology=True)
-                                if not g2.is_empty: simplified.append((g2, code, name, area_ha))
-                            clipped = simplified or clipped
-                        kml = _render_parcel_kml(lp, clipped, [], bore_points)
-                        kmz_data = _kmz_bytes(kml, bore_assets)
-                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz", kmz_data)
-                        row["status_kmz"]="ok"; row["file_kmz"]=f"{(prefix+'_') if prefix else ''}{lp}_landtypes.kmz"
-                else:
-                    row["status_tiff"]="skip"; row["status_kmz"]="skip"; row["message"]="No Land Types intersect."
-            except Exception as e:
-                row["lt_error"]=str(e)
-
-            # Vegetation (always included now)
-            try:
-                veg_fc = fetch_features_intersecting_envelope(veg_url, veg_layer, env, out_sr=4326, out_fields="*")
-                feats = veg_fc.get("features", [])
-                for f in feats:
-                    p = f.get("properties") or {}
-                    code = (p.get(veg_code) if veg_code else "") or (p.get(veg_name) or "UNK")
-                    name = p.get(veg_name) or code
-                    p["code"] = str(code)
-                    # Format vegetation names as "Category *"
-                    category_name = str(name)
-                    p["name"] = f"Category {category_name}"
-                    f["properties"] = p
-                veg_fc["features"] = feats
-                vclipped = prepare_clipped_shapes(parcel_fc, veg_fc)
-                if vclipped:
-                    if payload.include_veg_tiff:
-                        tmpdir = tempfile.mkdtemp(prefix="tif_"); path = os.path.join(tmpdir, f"{lp}_vegetation.tif")
-                        _ = make_geotiff_rgba(vclipped, path, max_px=payload.max_px)
-                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif", open(path,"rb").read())
-                        try: os.remove(path); os.rmdir(tmpdir)
-                        except Exception: pass
-                        row["status_veg_tiff"]="ok"; row["file_veg_tiff"]=f"{(prefix+'_') if prefix else ''}{lp}_vegetation.tif"
-                    if payload.include_veg_kmz:
-                        kml = build_kml(vclipped, color_fn=color_from_code, folder_name=f"Vegetation – {lp}")
-                        mem = BytesIO()
-                        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as ztmp:
-                            ztmp.writestr("doc.kml", kml.encode("utf-8"))
-                        zf.writestr(f"{(prefix+'_') if prefix else ''}{lp}_vegetation.kmz", mem.getvalue())
-                        row["status_veg_kmz"]="ok"; row["file_veg_kmz"]=f"{(prefix+'_') if prefix else ''}{lp}_vegetation.kmz"
-                else:
-                    row["status_veg_tiff"]="skip"; row["status_veg_kmz"]="skip"; row["veg_message"]="No vegetation polygons intersect."
-            except Exception as e:
-                row["veg_error"]=str(e)
-
-            manifest_rows.append(row)
-
-        # CSV manifest
-        mem_csv = io.StringIO(newline='')
-        writer = csv.DictWriter(mem_csv, fieldnames=[
-            "lotplan",
-            "status_tiff","file_tiff","lt_error",
-            "status_kmz","file_kmz",
-            "status_veg_tiff","file_veg_tiff","veg_message",
-            "status_veg_kmz","file_veg_kmz","veg_error",
-            "message"
-        ])
-        writer.writeheader()
-        for r in manifest_rows:
-            writer.writerow({k: r.get(k,"") for k in writer.fieldnames})
-        zf.writestr("manifest.csv", mem_csv.getvalue().encode("utf-8"))
-
-    zip_buf.seek(0)
-    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base = f"{prefix+'_' if prefix else ''}export_bundle"
-    return StreamingResponse(
-        zip_buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{base}_{stamp}.zip"'},
+    return _create_bulk_kmz(
+        items,
+        simplify_tolerance=simplify,
+        veg_service_url=veg_url,
+        veg_layer_id=veg_layer,
+        veg_name_field=veg_name,
+        veg_code_field=veg_code,
+        filename=payload.filename,
     )
