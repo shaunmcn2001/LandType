@@ -6,6 +6,7 @@ import datetime as dt
 import html
 import io
 import logging
+import math
 import os
 import tempfile
 import zipfile
@@ -19,9 +20,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from shapely.geometry import mapping as shp_mapping, shape as shp_shape
+from shapely.validation import make_valid
 
 from .arcgis import (
     fetch_bores_intersecting_envelope,
+    fetch_easements_intersecting_envelope,
     fetch_features_intersecting_envelope,
     fetch_landtypes_intersecting_envelope,
     fetch_parcel_geojson,
@@ -36,6 +39,11 @@ from .config import (
     BORE_STATUS_LABEL_FIELD,
     BORE_TYPE_CODE_FIELD,
     BORE_TYPE_LABEL_FIELD,
+    EASEMENT_AREA_FIELD,
+    EASEMENT_FEATURE_NAME_FIELD,
+    EASEMENT_LOTPLAN_FIELD,
+    EASEMENT_PARCEL_TYPE_FIELD,
+    EASEMENT_TENURE_FIELD,
     VEG_CODE_FIELD_DEFAULT,
     VEG_LAYER_ID_DEFAULT,
     VEG_NAME_FIELD_DEFAULT,
@@ -153,6 +161,124 @@ def _normalize_bore_properties(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "drilled_date": drilled_date,
         "report_url": _or_none(report_url),
         "icon_key": icon_key,
+    }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        text = str(value)
+    except Exception:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    text = text.replace(",", "")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _clip_to_parcel_union(geom, parcel_union):
+    if geom.is_empty:
+        return None
+    if parcel_union is None or parcel_union.is_empty:
+        return geom
+    try:
+        if not parcel_union.intersects(geom):
+            return None
+    except Exception:
+        pass
+    try:
+        clipped = parcel_union.intersection(geom)
+    except Exception:
+        try:
+            clipped = parcel_union.intersection(make_valid(geom))
+        except Exception:
+            try:
+                clipped = make_valid(parcel_union).intersection(make_valid(geom))
+            except Exception:
+                clipped = geom
+    if clipped.is_empty:
+        return None
+    return clipped
+
+
+def _normalize_easement_properties(raw: Dict[str, Any], lotplan: str) -> Dict[str, Any]:
+    props = raw or {}
+
+    owner_lp = normalize_lotplan(
+        props.get("lotplan")
+        or props.get(EASEMENT_LOTPLAN_FIELD)
+        or props.get("lot_plan")
+        or lotplan
+    )
+
+    parcel_type = _clean_text(
+        props.get("parcel_type")
+        or props.get(EASEMENT_PARCEL_TYPE_FIELD)
+    )
+    name = _clean_text(
+        props.get("name")
+        or props.get(EASEMENT_FEATURE_NAME_FIELD)
+    )
+    alias = _clean_text(
+        props.get("alias")
+        or props.get("feat_alias")
+        or props.get("feature_alias")
+    )
+    tenure = _clean_text(
+        props.get("tenure")
+        or props.get(EASEMENT_TENURE_FIELD)
+    )
+
+    area_value = props.get("area_m2")
+    if area_value is None:
+        area_value = props.get(EASEMENT_AREA_FIELD)
+    area_m2 = _safe_float(area_value)
+
+    out: Dict[str, Any] = {
+        "lotplan": owner_lp or lotplan,
+        "parcel_type": parcel_type or None,
+        "name": name or alias or None,
+        "tenure": tenure or None,
+    }
+
+    if alias:
+        out["alias"] = alias
+
+    if area_m2 is not None:
+        out["area_m2"] = area_m2
+        out["area_ha"] = area_m2 / 10000.0
+
+    return out
+
+
+def _clean_bound_value(value: Any) -> Optional[float]:
+    number = _safe_float(value)
+    if number is None:
+        return None
+    if isinstance(number, float) and math.isnan(number):
+        return None
+    return number
+
+
+def _bounds_dict_from_geom(bounds_geom, fallback=None) -> Dict[str, Optional[float]]:
+    candidate = bounds_geom
+    if candidate is None or getattr(candidate, "is_empty", True):
+        candidate = fallback
+    if candidate is None or getattr(candidate, "is_empty", True):
+        return {"west": None, "south": None, "east": None, "north": None}
+    west, south, east, north = candidate.bounds
+    return {
+        "west": _clean_bound_value(west),
+        "south": _clean_bound_value(south),
+        "east": _clean_bound_value(east),
+        "north": _clean_bound_value(north),
     }
 
 
@@ -685,6 +811,8 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
             legend[code]["area_ha"] += float(area_ha)
         return JSONResponse({"lotplan": lotplan, "legend": sorted(legend.values(), key=lambda d: (-d["area_ha"], d["code"])), **public})
 
+
+
 @app.get("/vector")
 def vector_geojson(lotplan: str = Query(...)):
     lotplan = normalize_lotplan(lotplan)
@@ -694,8 +822,7 @@ def vector_geojson(lotplan: str = Query(...)):
     lt_fc = fetch_landtypes_intersecting_envelope(env)
     clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
     bore_fc = fetch_bores_intersecting_envelope(env)
-    if not clipped:
-        return JSONResponse({"error": "No Land Types intersect this parcel."}, status_code=404)
+    easement_fc = fetch_easements_intersecting_envelope(env)
 
     for feature in parcel_fc.get("features", []):
         props = feature.get("properties") or {}
@@ -705,22 +832,27 @@ def vector_geojson(lotplan: str = Query(...)):
         new_props["lotplan"] = lotplan
         feature["properties"] = new_props
 
-    features = []
-    legend_map = {}
+    features: List[Dict[str, Any]] = []
+    legend_map: Dict[str, Dict[str, Any]] = {}
     for geom4326, code, name, area_ha in clipped:
         color_hex = _hex(color_from_code(code))
-        features.append({
-            "type": "Feature",
-            "geometry": shp_mapping(geom4326),
-            "properties": {
-                "code": code,
-                "name": name,
-                "area_ha": float(area_ha),
-                "color_hex": color_hex,
-                "lotplan": lotplan,
-            },
-        })
-        legend_map.setdefault(code, {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0})
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": shp_mapping(geom4326),
+                "properties": {
+                    "code": code,
+                    "name": name,
+                    "area_ha": float(area_ha),
+                    "color_hex": color_hex,
+                    "lotplan": lotplan,
+                },
+            }
+        )
+        legend_map.setdefault(
+            code,
+            {"code": code, "name": name, "color_hex": color_hex, "area_ha": 0.0},
+        )
         legend_map[code]["area_ha"] += float(area_ha)
 
     bore_features: List[Dict[str, Any]] = []
@@ -740,28 +872,54 @@ def vector_geojson(lotplan: str = Query(...)):
             continue
         seen_bores.add(bore_number)
         norm_props["lotplan"] = lotplan
-        bore_features.append({
-            "type": "Feature",
-            "geometry": shp_mapping(geom),
-            "properties": norm_props,
-        })
+        bore_features.append(
+            {
+                "type": "Feature",
+                "geometry": shp_mapping(geom),
+                "properties": norm_props,
+            }
+        )
+
+    easement_features: List[Dict[str, Any]] = []
+    for easement in easement_fc.get("features", []):
+        try:
+            geom = shp_shape(easement.get("geometry"))
+        except Exception:
+            continue
+        if geom.is_empty:
+            continue
+        clipped_geom = _clip_to_parcel_union(geom, parcel_union)
+        if clipped_geom is None or clipped_geom.is_empty:
+            continue
+        props = _normalize_easement_properties(easement.get("properties") or {}, lotplan)
+        easement_features.append(
+            {
+                "type": "Feature",
+                "geometry": shp_mapping(clipped_geom),
+                "properties": props,
+            }
+        )
 
     bounds_fc = {"type": "FeatureCollection", "features": []}
     bounds_fc["features"].extend(parcel_fc.get("features", []))
     bounds_fc["features"].extend(features)
     bounds_fc["features"].extend(bore_features)
+    bounds_fc["features"].extend(easement_features)
     bounds_geom = to_shapely_union(bounds_fc)
-    if bounds_geom.is_empty:
-        bounds_geom = parcel_union
-    west, south, east, north = bounds_geom.bounds
-    return JSONResponse({
+    bounds_dict = _bounds_dict_from_geom(bounds_geom, parcel_union)
+    status_code = 200 if features else 404
+    payload = {
         "lotplan": lotplan,
         "parcel": parcel_fc,
-        "landtypes": { "type":"FeatureCollection", "features": features },
+        "landtypes": {"type": "FeatureCollection", "features": features},
         "bores": {"type": "FeatureCollection", "features": bore_features},
+        "easements": {"type": "FeatureCollection", "features": easement_features},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
-        "bounds4326": {"west": west, "south": south, "east": east, "north": north}
-    })
+        "bounds4326": bounds_dict,
+    }
+    if status_code != 200:
+        payload["error"] = "No Land Types intersect this parcel."
+    return JSONResponse(payload, status_code=status_code)
 
 
 class VectorBulkRequest(BaseModel):
@@ -788,6 +946,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
     parcel_features: List[Dict[str, Any]] = []
     landtype_features: List[Dict[str, Any]] = []
     bore_features: List[Dict[str, Any]] = []
+    easement_features: List[Dict[str, Any]] = []
     legend_map: Dict[str, Dict[str, Any]] = {}
     bounds = None
     seen_bore_numbers: Set[str] = set()
@@ -828,6 +987,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
         lt_fc = fetch_landtypes_intersecting_envelope(env)
         clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
         bore_fc = fetch_bores_intersecting_envelope(env)
+        easement_fc = fetch_easements_intersecting_envelope(env)
 
         for bore in bore_fc.get("features", []):
             try:
@@ -850,6 +1010,26 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
                 "properties": norm_props,
             })
             bounds = expand_bounds(bounds, geom)
+
+        for easement in easement_fc.get("features", []):
+            try:
+                geom = shp_shape(easement.get("geometry"))
+            except Exception:
+                continue
+            if geom.is_empty:
+                continue
+            clipped_geom = _clip_to_parcel_union(geom, parcel_union)
+            if clipped_geom is None or clipped_geom.is_empty:
+                continue
+            props = _normalize_easement_properties(easement.get("properties") or {}, lotplan)
+            easement_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": shp_mapping(clipped_geom),
+                    "properties": props,
+                }
+            )
+            bounds = expand_bounds(bounds, clipped_geom)
 
         for geom4326, code, name, area_ha in clipped:
             if geom4326.is_empty:
@@ -875,7 +1055,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
             })
             legend_map[code]["area_ha"] += float(area_ha)
 
-    if not parcel_features and not landtype_features and not bore_features:
+    if not parcel_features and not landtype_features and not bore_features and not easement_features:
         raise HTTPException(status_code=404, detail="No features found for the provided lots/plans.")
 
     bounds_dict = None
@@ -888,6 +1068,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
         "parcels": {"type": "FeatureCollection", "features": parcel_features},
         "landtypes": {"type": "FeatureCollection", "features": landtype_features},
         "bores": {"type": "FeatureCollection", "features": bore_features},
+        "easements": {"type": "FeatureCollection", "features": easement_features},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": bounds_dict,
     })

@@ -10,6 +10,16 @@ PARCEL_LOTPLAN_FIELD = "lotplan"   # combined, e.g. 13SP181800
 PARCEL_LOT_FIELD = "lot"           # split fallback
 PARCEL_PLAN_FIELD = "plan"
 
+# ── Easements (DCDB easement parcels)
+# Source: PlanningCadastre / LandParcelPropertyFramework → layer 9 "Easements"
+EASEMENT_SERVICE_URL = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer"
+EASEMENT_LAYER_ID = 9
+EASEMENT_LOTPLAN_FIELD = "lotplan"
+EASEMENT_PARCEL_TYPE_FIELD = "parcel_typ"
+EASEMENT_FEATURE_NAME_FIELD = "feat_name"
+EASEMENT_TENURE_FIELD = "tenure"
+EASEMENT_AREA_FIELD = "lot_area"
+
 # ── Land Types (GLM)
 # Source: Environment / LandTypes → layer 1 "Land types"
 LANDTYPES_SERVICE_URL = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/Environment/LandTypes/MapServer"

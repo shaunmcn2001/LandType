@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List
 import requests
 
 from .config import (
+    ARCGIS_MAX_RECORDS,
+    ARCGIS_TIMEOUT,
     BORE_DRILL_DATE_FIELD,
     BORE_LAYER_ID,
     BORE_NUMBER_FIELD,
@@ -17,8 +19,13 @@ from .config import (
     BORE_STATUS_LABEL_FIELD,
     BORE_TYPE_CODE_FIELD,
     BORE_TYPE_LABEL_FIELD,
-    ARCGIS_MAX_RECORDS,
-    ARCGIS_TIMEOUT,
+    EASEMENT_AREA_FIELD,
+    EASEMENT_FEATURE_NAME_FIELD,
+    EASEMENT_LAYER_ID,
+    EASEMENT_LOTPLAN_FIELD,
+    EASEMENT_PARCEL_TYPE_FIELD,
+    EASEMENT_SERVICE_URL,
+    EASEMENT_TENURE_FIELD,
     LANDTYPES_CODE_FIELD,
     LANDTYPES_LAYER_ID,
     LANDTYPES_NAME_FIELD,
@@ -186,6 +193,29 @@ def _join_fields(fields: Iterable[str]) -> str:
         seen.add(key)
         out.append(key)
     return ",".join(out)
+
+
+def fetch_easements_intersecting_envelope(env_3857) -> Dict[str, Any]:
+    if not EASEMENT_SERVICE_URL or EASEMENT_LAYER_ID < 0:
+        raise RuntimeError("Easement service not configured.")
+
+    out_fields = _join_fields(
+        [
+            EASEMENT_LOTPLAN_FIELD,
+            EASEMENT_PARCEL_TYPE_FIELD,
+            EASEMENT_FEATURE_NAME_FIELD,
+            EASEMENT_TENURE_FIELD,
+            EASEMENT_AREA_FIELD,
+        ]
+    )
+
+    return fetch_features_intersecting_envelope(
+        EASEMENT_SERVICE_URL,
+        EASEMENT_LAYER_ID,
+        env_3857,
+        out_sr=4326,
+        out_fields=out_fields or "*",
+    )
 
 
 def fetch_bores_intersecting_envelope(env_3857) -> Dict[str, Any]:

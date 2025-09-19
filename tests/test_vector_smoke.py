@@ -14,3 +14,8 @@ def test_vector_smoke():
     r = c.get("/vector", params={"lotplan": "13SP181800"})
     assert r.status_code in (200, 404)
     assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert "easements" in data
+    assert isinstance(data["easements"], dict)
+    assert "features" in data["easements"]
+    assert isinstance(data["easements"]["features"], list)
