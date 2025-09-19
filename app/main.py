@@ -611,7 +611,7 @@ function updateMode(){
   }
 }
 
-let map=null, parcelLayer=null, ltLayer=null, boreLayer=null;
+let map=null, parcelLayer=null, ltLayer=null, boreLayer=null, easementLayer=null;
 function ensureMap(){
   try{
     if (map) return;
@@ -627,6 +627,7 @@ function clearLayers(){
     if(map && parcelLayer){ map.removeLayer(parcelLayer); parcelLayer=null; }
     if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; }
     if(map && boreLayer){ map.removeLayer(boreLayer); boreLayer=null; }
+    if(map && easementLayer){ map.removeLayer(easementLayer); easementLayer=null; }
   }catch{}
 }
 function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
@@ -702,9 +703,35 @@ async function loadVector(){
         }
       }).addTo(map);
     }
+    const easementData = data.easements;
+    if (easementData && Array.isArray(easementData.features) && easementData.features.length){
+      const easementStyle = { color: '#58b0ff', weight: 2, dashArray: '6 4', fillColor: '#58b0ff', fillOpacity: 0.15 };
+      easementLayer = L.geoJSON(easementData, {
+        style: () => easementStyle,
+        onEachFeature: (feature, layer) => {
+          const props = feature.properties || {};
+          const lines = [];
+          const title = props.name || props.alias;
+          lines.push(`<strong>${escHtml(title || 'Easement')}</strong>`);
+          if (props.alias && props.name){ lines.push(`<span class="muted">Alias:</span> ${escHtml(props.alias)}`); }
+          if (props.lotplan){ lines.push(`<span class="muted">Lot/Plan:</span> ${escHtml(props.lotplan)}`); }
+          if (props.parcel_type){ lines.push(`<span class="muted">Parcel Type:</span> ${escHtml(props.parcel_type)}`); }
+          if (props.tenure){ lines.push(`<span class="muted">Tenure:</span> ${escHtml(props.tenure)}`); }
+          const areaParts = [];
+          const areaHa = typeof props.area_ha === 'number' && !Number.isNaN(props.area_ha) ? props.area_ha : null;
+          const areaM2 = typeof props.area_m2 === 'number' && !Number.isNaN(props.area_m2) ? props.area_m2 : null;
+          if (areaHa != null){ areaParts.push(`${areaHa.toFixed(4)} ha`); }
+          if (areaM2 != null){ areaParts.push(`${areaM2.toLocaleString()} m²`); }
+          if (areaParts.length){ lines.push(`<span class="muted">Area:</span> ${areaParts.join(' / ')}`); }
+          layer.bindPopup(lines.join('<br/>'));
+        }
+      }).addTo(map);
+    }
     const b = data.bounds4326;
     if (b){
       map.fitBounds([[b.south, b.west],[b.north, b.east]], { padding:[20,20] });
+    } else if (easementLayer && easementLayer.getBounds){
+      map.fitBounds(easementLayer.getBounds(), { padding:[20,20] });
     } else if (parcelLayer && parcelLayer.getBounds){
       map.fitBounds(parcelLayer.getBounds(), { padding:[20,20] });
     } else if (ltLayer && ltLayer.getBounds){
@@ -715,7 +742,8 @@ async function loadVector(){
     const summary = {
       lotplans: data.lotplans || (data.lotplan ? [data.lotplan] : []),
       legend: data.legend || [],
-      bounds4326: data.bounds4326 || null
+      bounds4326: data.bounds4326 || null,
+      easement_count: easementData && Array.isArray(easementData.features) ? easementData.features.length : 0
     };
     $out.textContent = JSON.stringify(summary, null, 2);
   }catch(err){ $out.textContent = 'Network error: ' + err; }
