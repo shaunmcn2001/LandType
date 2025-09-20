@@ -731,7 +731,7 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
 <body>
 <div class="wrap"><div class="card">
   <h1>QLD Land Types <span class="badge">EPSG:4326</span> <span id="mode" class="chip">Mode: Single</span></h1>
-  <p>Paste one or many <strong>Lot / Plan</strong> codes. Downloads include <strong>GeoTIFF</strong> and <strong>KMZ</strong> outputs. <strong>Vegetation data is always included.</strong></p>
+  <p>Paste one or many <strong>Lot / Plan</strong> codes. Download a <strong>Property Report (KMZ)</strong> with land types, vegetation, bores, and easements for every parcel.</p>
 
   <div class="row">
     <div style="flex: 2 1 420px;">
@@ -744,15 +744,14 @@ button.primary{background:var(--accent);color:#071021}a.ghost{color:var(--accent
     <div>
       <label for="name">Name (single) or Prefix (bulk)</label>
       <input id="name" type="text" placeholder="e.g. UpperCoomera_13SP181800 or Job_4021" />
-      <div class="box muted">Exports always include both GeoTIFF and KMZ files.</div>
+      <div class="box muted">Exports generate a KMZ you can open in Google Earth or other GIS viewers.</div>
     </div>
   </div>
 
 
 
   <div class="btns">
-    <button class="primary" id="btn-export-tiff">Download GeoTIFF</button>
-    <button class="primary" id="btn-export-kmz">Download KMZ</button>
+    <button class="primary" id="btn-export-report">Download Property Report (KMZ)</button>
     <a class="ghost" id="btn-json" href="#">Preview JSON (single)</a>
     <a class="ghost" id="btn-load" href="#">Load on Map</a>
   </div>
@@ -768,8 +767,7 @@ const $items = document.getElementById('items'),
       $mode = document.getElementById('mode'),
       $out = document.getElementById('out'),
       $parseinfo = document.getElementById('parseinfo'),
-      $btnExportTiff = document.getElementById('btn-export-tiff'),
-      $btnExportKmz = document.getElementById('btn-export-kmz'),
+      $btnExportReport = document.getElementById('btn-export-report'),
       $btnJson = document.getElementById('btn-json'),
       $btnLoad = document.getElementById('btn-load');
 
@@ -989,22 +987,17 @@ async function previewJson(){
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
 
-async function exportAny(targetFormat){
+async function exportPropertyReport(){
   const items = parseItems($items.value);
   if (!items.length){ $out.textContent = 'Enter at least one Lot/Plan.'; return; }
-  const format = targetFormat === 'kmz' ? 'kmz' : 'tiff';
   const body = {
-    format,
-    max_px: DEFAULT_MAX_PX,
+    lotplans: items,
     simplify_tolerance: DEFAULT_SIMPLIFY,
-    include_veg_tiff: true, include_veg_kmz: true,
-    veg_service_url: '%VEG_URL%', veg_layer_id: %VEG_LAYER%,
-    veg_name_field: '%VEG_NAME%', veg_code_field: '%VEG_CODE%',
   };
   const name = normText($name.value) || null;
-  if (items.length === 1){ body.lotplan = items[0]; if (name) body.filename = name; } else { body.lotplans = items; if (name) body.filename_prefix = name; }
-  const label = format === 'kmz' ? 'KMZ' : 'GeoTIFF';
-  $out.textContent = items.length === 1 ? `Exporting ${label}…` : `Exporting ${label} for ${items.length} items…`;
+  if (name){ body.filename = name; }
+  const multi = items.length > 1;
+  $out.textContent = multi ? `Exporting Property Report for ${items.length} items…` : 'Exporting Property Report…';
   try{
     const res = await fetch('/export/any', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const disp = res.headers.get('content-disposition') || '';
@@ -1012,9 +1005,16 @@ async function exportAny(targetFormat){
     const blob = await res.blob();
     if (!ok){ const txt = await blob.text(); $out.textContent = `Error ${res.status}: ${txt}`; return; }
     const m = /filename="([^"]+)"/i.exec(disp);
-    let dl = m ? m[1] : `export_${Date.now()}`;
-    if (items.length > 1 && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
-    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = dl; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    let dl = m ? m[1] : `property_report_${Date.now()}`;
+    if (multi && name && !dl.startsWith(name)) dl = `${name}_${dl}`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = dl;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
     $out.textContent = 'Download complete.';
   }catch(err){ $out.textContent = 'Network error: ' + err; }
 }
@@ -1024,8 +1024,7 @@ $items.addEventListener('keyup', updateMode);
 $items.addEventListener('change', updateMode);
 $btnLoad.addEventListener('click', (e)=>{ e.preventDefault(); loadVector(); });
 $btnJson.addEventListener('click', (e)=>{ e.preventDefault(); previewJson(); });
-$btnExportTiff.addEventListener('click', (e)=>{ e.preventDefault(); exportAny('tiff'); });
-$btnExportKmz.addEventListener('click', (e)=>{ e.preventDefault(); exportAny('kmz'); });
+$btnExportReport.addEventListener('click', (e)=>{ e.preventDefault(); exportPropertyReport(); });
 updateMode(); setTimeout(()=>{ ensureMap(); $items.focus(); }, 30);
 </script>
 </body></html>"""
