@@ -35,6 +35,15 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
     monkeypatch.setattr(main, "bbox_3857", lambda geom: (0, 0, 1, 1))
 
     def fake_prepare_clipped_shapes(parcel, features):
+        feats = (features or {}).get("features", [])
+        if feats:
+            prepared = []
+            for feat in feats:
+                props = feat.get("properties") or {}
+                code = props.get("code", "LT1")
+                name = props.get("name", "Test Land Type")
+                prepared.append((polygon, code, name, 1.0))
+            return prepared
         return [(polygon, "LT1", "Test Land Type", 1.0)]
 
     monkeypatch.setattr(main, "prepare_clipped_shapes", fake_prepare_clipped_shapes)
@@ -62,11 +71,38 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
 
     monkeypatch.setattr(main, "fetch_bores_intersecting_envelope", lambda env: bore_fc)
 
+    easement_polygon = Polygon([(0.2, 0.2), (0.2, 0.8), (0.8, 0.8), (0.8, 0.2)])
+    easement_fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": mapping(easement_polygon),
+                "properties": {
+                    "lotplan": "1TEST",
+                    "parcel_typ": "EASEMENT",  # uses config default field names
+                    "feat_name": "Access Easement",
+                    "tenure": "Freehold",
+                    "lot_area": 123.0,
+                },
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        main,
+        "fetch_easements_intersecting_envelope",
+        lambda env: easement_fc,
+    )
+
     client = TestClient(main.app)
     response = client.get("/export_kmz", params={"lotplan": "1TEST", "veg_url": ""})
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/vnd.google-earth.kmz")
+    disposition = response.headers.get("content-disposition", "")
+    assert "Property Report - 1TEST.kmz" in disposition
+    assert "filename*=UTF-8''Property%20Report%20%E2%80%93%201TEST.kmz" in disposition
 
     with zipfile.ZipFile(io.BytesIO(response.content)) as kmz:
         names = kmz.namelist()
@@ -76,3 +112,11 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
         for name in icon_entries:
             data = kmz.read(name)
             assert data, f"KMZ asset {name} is empty"
+
+        doc_text = kmz.read("doc.kml").decode("utf-8")
+        assert "Property Report" in doc_text
+        assert "<name>Land Types</name>" in doc_text
+        assert "<name>Vegetation</name>" in doc_text
+        assert "<name>Easements</name>" in doc_text
+        assert "<name>Groundwater Bores</name>" in doc_text
+        assert "Lot/Plan: 1TEST" in doc_text
