@@ -114,9 +114,17 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
             assert data, f"KMZ asset {name} is empty"
 
         doc_text = kmz.read("doc.kml").decode("utf-8")
-        assert "Property Report" in doc_text
-        assert "<name>Land Types</name>" in doc_text
-        assert "<name>Vegetation</name>" in doc_text
-        assert "<name>Easements</name>" in doc_text
-        assert "<name>Groundwater Bores</name>" in doc_text
-        assert "Lot/Plan: 1TEST" in doc_text
+        assert "Property Report – 1TEST" in doc_text
+        assert "<Document><name>Property Report – 1TEST</name>" in doc_text
+        assert "<Folder><name>Land Types</name>" in doc_text
+        assert "<Folder><name>Vegetation</name>" in doc_text
+        easement_marker = "<Folder><name>Easements</name>"
+        assert easement_marker in doc_text
+        easement_section = doc_text.split(easement_marker, 1)[1]
+        assert "<Polygon" in easement_section or "<MultiGeometry" in easement_section
+        assert "Parcel Type: EASEMENT" in doc_text
+        assert "Tenure: Freehold" in doc_text
+        assert "Alias: -" in doc_text
+        assert "Area: " in doc_text
+        assert "Access Easement (Lot/Plan: 1TEST" in doc_text
+        assert "<Folder><name>Groundwater Bores</name>" in doc_text
