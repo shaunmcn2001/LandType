@@ -552,7 +552,7 @@ def build_property_report_kmz(
 
     easement_fc = fetch_easements_intersecting_envelope(env)
     easement_features: List[Dict[str, Any]] = []
-    easement_color_lookup: Dict[str, str] = {}
+    easement_meta: Dict[str, Dict[str, Any]] = {}
     for feature in (easement_fc or {}).get("features", []):
         geometry = feature.get("geometry")
         if not geometry:
@@ -561,27 +561,33 @@ def build_property_report_kmz(
         owner_lp = props.get("lotplan") or lotplan_norm
         parcel_type = props.get("parcel_type") or ""
         tenure = props.get("tenure") or ""
-        alias = props.get("alias")
+        alias = props.get("alias") or ""
         display_name = props.get("name") or alias or "Easement"
-        desc_parts = [f"Lot/Plan: {owner_lp}"]
-        desc_parts.append(f"Parcel Type: {parcel_type or '-'}")
-        desc_parts.append(f"Tenure: {tenure or '-'}")
-        desc_parts.append(f"Alias: {alias or '-'}")
-        code_text = " | ".join(desc_parts)
+        identifier_parts = [owner_lp or "", parcel_type, tenure, alias, display_name]
+        sanitized_parts = [(part or "").replace("|", "/") for part in identifier_parts]
+        identifier = "|".join(sanitized_parts).strip("|") or (owner_lp or lotplan_norm or "Easement")
         color_key = parcel_type or tenure or owner_lp or "Easement"
-        easement_color_lookup[code_text] = color_key
+        easement_meta[identifier] = {
+            "lotplan": owner_lp,
+            "parcel_type": parcel_type,
+            "tenure": tenure,
+            "alias": alias,
+            "display_name": display_name,
+            "color_key": color_key,
+            "area_ha": props.get("area_ha"),
+        }
         easement_features.append(
             {
                 "type": "Feature",
                 "geometry": geometry,
                 "properties": {
-                    "code": code_text,
+                    "code": identifier,
                     "name": display_name,
                 },
             }
         )
 
-    easement_clipped = prepare_clipped_shapes(
+    easement_clipped_raw = prepare_clipped_shapes(
         parcel_fc,
         {"type": "FeatureCollection", "features": easement_features},
     )
@@ -602,8 +608,47 @@ def build_property_report_kmz(
         lt_clipped = list(_simplify(lt_clipped))
         if veg_clipped:
             veg_clipped = list(_simplify(veg_clipped))
-        if easement_clipped:
-            easement_clipped = list(_simplify(easement_clipped))
+        if easement_clipped_raw:
+            easement_clipped_raw = list(_simplify(easement_clipped_raw))
+
+    easement_clipped: List[tuple] = []
+    easement_color_lookup: Dict[str, str] = {}
+    for geom4326, identifier, display_name, area_ha in easement_clipped_raw:
+        meta = easement_meta.get(identifier, {})
+
+        def _display(value: Optional[str]) -> str:
+            text = (value or "").strip()
+            return text or "-"
+
+        owner_lp = _display(meta.get("lotplan") or lotplan_norm)
+        parcel_type = _display(meta.get("parcel_type"))
+        tenure = _display(meta.get("tenure"))
+        alias = _display(meta.get("alias"))
+
+        area_value = 0.0
+        if area_ha is not None:
+            try:
+                area_value = float(area_ha)
+            except (TypeError, ValueError):
+                area_value = 0.0
+        if area_value == 0.0:
+            fallback_area = _safe_float(meta.get("area_ha"))
+            if fallback_area is not None:
+                area_value = float(fallback_area)
+
+        desc_parts = [
+            f"Lot/Plan: {owner_lp}",
+            f"Parcel Type: {parcel_type}",
+            f"Tenure: {tenure}",
+            f"Alias: {alias}",
+            f"Area: {area_value:.2f} ha",
+        ]
+        code_text = " | ".join(desc_parts)
+        color_key = meta.get("color_key") or identifier or "Easement"
+        easement_color_lookup[code_text] = color_key
+        display_label = meta.get("display_name") or display_name or "Easement"
+        area_for_tuple = area_ha if area_ha is not None else area_value
+        easement_clipped.append((geom4326, code_text, display_label, area_for_tuple))
 
     def _easement_color_fn(code: str) -> Tuple[int, int, int]:
         base = easement_color_lookup.get(code, code)
