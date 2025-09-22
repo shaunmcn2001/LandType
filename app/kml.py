@@ -3,13 +3,25 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
 try:
-    from shapely.geometry import MultiPolygon, Polygon
+    from shapely.geometry import (
+        GeometryCollection,
+        LineString,
+        MultiLineString,
+        MultiPoint,
+        MultiPolygon,
+        Point,
+        Polygon,
+    )
 except Exception:
-    Polygon = MultiPolygon = None  # type: ignore
+    GeometryCollection = (
+        LineString
+    ) = (
+        MultiLineString
+    ) = MultiPoint = MultiPolygon = Point = Polygon = cast(Any, None)
 
 def _kml_color_abgr_with_alpha(rgb: Tuple[int,int,int], alpha: int = 160) -> str:
     r, g, b = [max(0, min(255, int(v))) for v in rgb]
@@ -66,6 +78,13 @@ def _coords_to_kml_ring(coords) -> str:
         pts.append(pts[0])
     return " ".join(f"{float(x):.8f},{float(y):.8f},0" for x, y in pts)
 
+
+def _coords_to_kml_path(coords) -> str:
+    pts = list(coords)
+    if len(pts) == 0:
+        return ""
+    return " ".join(f"{float(x):.8f},{float(y):.8f},0" for x, y in pts)
+
 def _geom_to_kml_polygons(geom) -> Iterable[str]:
     if Polygon is None or MultiPolygon is None:
         raise RuntimeError("Shapely is required for KML polygon conversion")
@@ -92,6 +111,100 @@ def _geom_to_kml_polygons(geom) -> Iterable[str]:
             for ring in inners if ring
         )
         yield f"<Polygon><outerBoundaryIs><LinearRing><coordinates>{ext}</coordinates></LinearRing></outerBoundaryIs>{inner_xml}</Polygon>"
+
+
+def _geom_to_kml_geometry(geom) -> str:
+    if geom is None:
+        return ""
+    if Polygon is None:
+        raise RuntimeError("Shapely is required for KML geometry conversion")
+
+    try:
+        geom_type = geom.geom_type
+    except Exception:
+        geom_type = None
+
+    if geom_type in ("Polygon", "MultiPolygon"):
+        try:
+            polys = list(_geom_to_kml_polygons(geom))
+        except Exception:
+            polys = []
+        if not polys:
+            return ""
+        if len(polys) == 1:
+            return polys[0]
+        return "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
+
+    if geom_type == "LineString":
+        try:
+            coords = geom.coords
+        except Exception:
+            coords = []
+        path = _coords_to_kml_path(coords)
+        if not path:
+            return ""
+        return f"<LineString><tessellate>1</tessellate><coordinates>{path}</coordinates></LineString>"
+
+    if geom_type == "MultiLineString":
+        try:
+            geoms = list(geom.geoms)
+        except Exception:
+            geoms = []
+        parts = []
+        for part in geoms:
+            xml = _geom_to_kml_geometry(part)
+            if xml:
+                parts.append(xml)
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        return "<MultiGeometry>" + "".join(parts) + "</MultiGeometry>"
+
+    if geom_type == "Point":
+        try:
+            coords = f"{float(geom.x):.8f},{float(geom.y):.8f},0"
+        except Exception:
+            return ""
+        return f"<Point><coordinates>{coords}</coordinates></Point>"
+
+    if geom_type == "MultiPoint":
+        try:
+            geoms = list(geom.geoms)
+        except Exception:
+            geoms = []
+        points = []
+        for part in geoms:
+            if part is None or getattr(part, "is_empty", False):
+                continue
+            try:
+                coords = f"{float(part.x):.8f},{float(part.y):.8f},0"
+            except Exception:
+                continue
+            points.append(f"<Point><coordinates>{coords}</coordinates></Point>")
+        if not points:
+            return ""
+        if len(points) == 1:
+            return points[0]
+        return "<MultiGeometry>" + "".join(points) + "</MultiGeometry>"
+
+    if geom_type == "GeometryCollection":
+        try:
+            geoms = list(geom.geoms)
+        except Exception:
+            geoms = []
+        pieces = []
+        for part in geoms:
+            xml = _geom_to_kml_geometry(part)
+            if xml:
+                pieces.append(xml)
+        if not pieces:
+            return ""
+        if len(pieces) == 1:
+            return pieces[0]
+        return "<MultiGeometry>" + "".join(pieces) + "</MultiGeometry>"
+
+    return ""
 
 def _collect_point_styles(points: Sequence[PointPlacemark]) -> Mapping[str, Tuple[str, float]]:
     styles: dict[str, Tuple[str, float]] = {}
@@ -139,14 +252,17 @@ def build_kml(
     placemarks: list[str] = []
     for geom, code, name, area_ha in clipped:
         esc_name = html.escape(name or code or "Unknown")
-        desc = f"<![CDATA[<b>{esc_name}</b><br/>Code: <code>{html.escape(code)}</code><br/>Area: {float(area_ha):.2f} ha]]>"
+        desc_parts = [f"<b>{esc_name}</b>", f"Code: <code>{html.escape(code)}</code>"]
         try:
-            polys = list(_geom_to_kml_polygons(geom))
-        except Exception:
-            polys = []
-        if not polys:
+            area_val = float(area_ha)
+        except (TypeError, ValueError):
+            area_val = None
+        if area_val and area_val > 0:
+            desc_parts.append(f"Area: {area_val:.2f} ha")
+        desc = f"<![CDATA[{'<br/>'.join(desc_parts)}]]>"
+        geom_xml = _geom_to_kml_geometry(geom)
+        if not geom_xml:
             continue
-        geom_xml = polys[0] if len(polys) == 1 else "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
         placemarks.append(
             f"<Placemark>"
             f"<name>{esc_name} ({html.escape(code)})</name>"
@@ -179,101 +295,61 @@ def build_kml(
     )
     return kml
 
-def _unpack_group(group):
-    if isinstance(group, tuple) or isinstance(group, list):
-        if len(group) >= 4:
-            clipped, color_fn, folder_name, point_data = group[:4]
-        else:
+def _unpack_group(
+    group: Any,
+) -> tuple[
+    list[Any],
+    Optional[Callable[[str], Tuple[int, int, int]]],
+    Optional[str],
+    list[PointPlacemark],
+    list[Any],
+]:
+    clipped: list[Any] = []
+    color_fn: Optional[Callable[[str], Tuple[int, int, int]]] = None
+    folder_name: Optional[str] = None
+    point_data: Optional[Iterable[PointPlacemark]] = None
+    children: Optional[Iterable[Any]] = None
+
+    if isinstance(group, (tuple, list)):
+        if len(group) >= 5:
+            clipped, color_fn, folder_name, point_data, children = group[:5]
+        elif len(group) == 4:
+            clipped, color_fn, folder_name, point_data = group
+        elif len(group) == 3:
             clipped, color_fn, folder_name = group
-            point_data = None
+        elif len(group) == 2:
+            clipped, color_fn = group
+        elif len(group) == 1:
+            clipped = group[0]
     else:
-        clipped, color_fn, folder_name = group
-        point_data = None
+        clipped = group
+
     points = list(point_data or [])
-    return clipped, color_fn, folder_name, points
+    nested = list(children or [])
+    return clipped, color_fn, folder_name, points, nested
 
 
 def build_kml_folders(
-    groups: Iterable[Tuple[Iterable, Callable[[str], Tuple[int, int, int]], str]],
+    groups: Iterable[Any],
     doc_name: Optional[str] = None,
 ) -> str:
-    """Build a KML document with multiple folders.
+    """Build a KML document with multiple folders."""
 
-    `groups` is an iterable of `(clipped, color_fn, folder_name)` tuples, where
-    `clipped` is as expected by :func:`build_kml`.
-    """
-    doc_label = html.escape(doc_name or "Export")
-    styles: dict[str, str] = {}
-    point_styles: dict[str, Tuple[str, float]] = {}
-
-    unpacked_groups = []
+    nested_groups = []
     for group in groups:
-        clipped, color_fn, folder_title, points = _unpack_group(group)
-        unpacked_groups.append((clipped, color_fn, folder_title, points))
-        for _geom, code, _name, _area in clipped:
-            if code in styles:
-                continue
-            rgb = color_fn(code)
-            styles[code] = _kml_color_abgr_with_alpha(rgb, alpha=180)
-        for point in points:
-            if not point.style_id or not point.icon_href:
-                continue
-            if point.style_id in point_styles:
-                continue
-            point_styles[point.style_id] = (point.icon_href, point.scale or 1.0)
+        clipped, color_fn, folder_title, points, children = _unpack_group(group)
+        folder_label = folder_title or "Layer"
+        subgroups = []
+        if clipped or points:
+            subgroups.append((clipped, color_fn, None, points))
+        subgroups.extend(children or [])
+        nested_groups.append((folder_label, subgroups))
 
-    style_xml = []
-    for code, kml_color in styles.items():
-        style_xml.append(
-            f"<Style id=\"s_{html.escape(code)}\">"
-            f"<LineStyle><color>ff000000</color><width>1.2</width></LineStyle>"
-            f"<PolyStyle><color>{kml_color}</color><fill>1</fill><outline>1</outline></PolyStyle>"
-            f"</Style>"
-        )
+    return build_kml_nested_folders(nested_groups, doc_name=doc_name)
 
-    for style_id, (icon_href, scale) in point_styles.items():
-        style_xml.append(_point_style_xml(style_id, icon_href, scale=scale))
-
-    folder_xml = []
-    for clipped, _color_fn, fname, points in unpacked_groups:
-        folder_label = html.escape(fname or "Layer")
-        placemarks = []
-        for geom, code, name, area_ha in clipped:
-            esc_name = html.escape(name or code or "Unknown")
-            desc = f"<![CDATA[<b>{esc_name}</b><br/>Code: <code>{html.escape(code)}</code><br/>Area: {float(area_ha):.2f} ha]]>"
-            try:
-                polys = list(_geom_to_kml_polygons(geom))
-            except Exception:
-                polys = []
-            if not polys:
-                continue
-            geom_xml = polys[0] if len(polys) == 1 else "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
-            placemarks.append(
-                f"<Placemark>"
-                f"<name>{esc_name} ({html.escape(code)})</name>"
-                f"<description>{desc}</description>"
-                f"<styleUrl>#s_{html.escape(code)}</styleUrl>"
-                f"{geom_xml}"
-                f"</Placemark>"
-            )
-        for point in points:
-            placemarks.append(_point_placemark_xml(point))
-        folder_xml.append(f"<Folder><name>{folder_label}</name>" + "".join(placemarks) + "</Folder>")
-
-    kml = (
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-        "<kml xmlns=\"http://www.opengis.net/kml/2.2\">"
-        "<Document>"
-        f"<name>{doc_label}</name>"
-        + "".join(style_xml)
-        + "".join(folder_xml)
-        + "</Document>"
-        "</kml>"
-    )
-    return kml
 
 def build_kml_nested_folders(
-    nested_groups: Iterable[Tuple[str, Iterable[Tuple[Iterable, Callable[[str], Tuple[int, int, int]], str]]]],
+    nested_groups: Iterable[Tuple[str, Iterable[Any]]],
     doc_name: Optional[str] = None,
 ) -> str:
     """Build a KML document with nested folder structure.
@@ -284,26 +360,33 @@ def build_kml_nested_folders(
     doc_label = html.escape(doc_name or "Export")
     styles: dict[str, str] = {}
     point_styles: dict[str, Tuple[str, float]] = {}
-    unpacked_nested = []
 
-    # Collect styles across all nested groups
-    for parent_name, subgroups in nested_groups:
-        unpacked_subgroups = []
-        for group in subgroups:
-            clipped, color_fn, fname, points = _unpack_group(group)
-            unpacked_subgroups.append((clipped, color_fn, fname, points))
-            for _geom, code, _name, _area in clipped:
-                if code in styles:
-                    continue
-                rgb = color_fn(code)
-                styles[code] = _kml_color_abgr_with_alpha(rgb, alpha=180)
+    def process_groups(groups):
+        processed = []
+        for group in groups:
+            clipped, color_fn, folder_name, points, children = _unpack_group(group)
+            processed_children = process_groups(children)
+            processed.append((clipped, color_fn, folder_name, points, processed_children))
+
+            if color_fn:
+                for _geom, code, _name, _area in clipped:
+                    if code in styles:
+                        continue
+                    rgb = color_fn(code)
+                    styles[code] = _kml_color_abgr_with_alpha(rgb, alpha=180)
+
             for point in points:
                 if not point.style_id or not point.icon_href:
                     continue
                 if point.style_id in point_styles:
                     continue
                 point_styles[point.style_id] = (point.icon_href, point.scale or 1.0)
-        unpacked_nested.append((parent_name, unpacked_subgroups))
+
+        return processed
+
+    processed_nested = []
+    for parent_name, subgroups in nested_groups:
+        processed_nested.append((parent_name, process_groups(subgroups)))
 
     style_xml = []
     for code, kml_color in styles.items():
@@ -317,25 +400,24 @@ def build_kml_nested_folders(
     for style_id, (icon_href, scale) in point_styles.items():
         style_xml.append(_point_style_xml(style_id, icon_href, scale=scale))
 
-    parent_folder_xml = []
-    for parent_name, subgroups in unpacked_nested:
-        parent_label = html.escape(parent_name or "Folder")
-
-        # Create subfolders within this parent
-        subfolder_xml = []
-        for clipped, _color_fn, subfolder_name, points in subgroups:
-            subfolder_label = html.escape(subfolder_name or "Layer")
+    def render_groups(groups):
+        direct_content: list[str] = []
+        folder_content: list[str] = []
+        for clipped, _color_fn, folder_name, points, children in groups:
             placemarks = []
             for geom, code, name, area_ha in clipped:
                 esc_name = html.escape(name or code or "Unknown")
-                desc = f"<![CDATA[<b>{esc_name}</b><br/>Code: <code>{html.escape(code)}</code><br/>Area: {float(area_ha):.2f} ha]]>"
+                desc_parts = [f"<b>{esc_name}</b>", f"Code: <code>{html.escape(code)}</code>"]
                 try:
-                    polys = list(_geom_to_kml_polygons(geom))
-                except Exception:
-                    polys = []
-                if not polys:
+                    area_val = float(area_ha)
+                except (TypeError, ValueError):
+                    area_val = None
+                if area_val and area_val > 0:
+                    desc_parts.append(f"Area: {area_val:.2f} ha")
+                desc = f"<![CDATA[{'<br/>'.join(desc_parts)}]]>"
+                geom_xml = _geom_to_kml_geometry(geom)
+                if not geom_xml:
                     continue
-                geom_xml = polys[0] if len(polys) == 1 else "<MultiGeometry>" + "".join(polys) + "</MultiGeometry>"
                 placemarks.append(
                     f"<Placemark>"
                     f"<name>{esc_name} ({html.escape(code)})</name>"
@@ -346,9 +428,23 @@ def build_kml_nested_folders(
                 )
             for point in points:
                 placemarks.append(_point_placemark_xml(point))
-            subfolder_xml.append(f"<Folder><name>{subfolder_label}</name>" + "".join(placemarks) + "</Folder>")
 
-        parent_folder_xml.append(f"<Folder><name>{parent_label}</name>" + "".join(subfolder_xml) + "</Folder>")
+            child_xml = render_groups(children)
+            content = "".join(placemarks) + child_xml
+            if folder_name:
+                folder_label = html.escape(folder_name)
+                folder_content.append(f"<Folder><name>{folder_label}</name>{content}</Folder>")
+            else:
+                direct_content.append(content)
+
+        return "".join(direct_content + folder_content)
+
+    parent_folder_xml = []
+    for parent_name, subgroups in processed_nested:
+        parent_label = html.escape(parent_name or "Folder")
+        parent_folder_xml.append(
+            f"<Folder><name>{parent_label}</name>" + render_groups(subgroups) + "</Folder>"
+        )
 
     kml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"

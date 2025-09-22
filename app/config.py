@@ -342,6 +342,89 @@ BORE_ICON_MAP = {
     },
 }
 
+# ── Surface Water (Water courses and bodies)
+# Source: InlandWaters / WaterCoursesAndBodies → layers 20–37
+WATER_SERVICE_URL = "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/InlandWaters/WaterCoursesAndBodies/MapServer"
+WATER_LAYER_CONFIG = {
+    20: {
+        "title": "Farm Dams",
+        "service_name": "Farm dam",
+        "geometry_type": "esriGeometryPoint",
+    },
+    21: {
+        "title": "Pools or Rockholes",
+        "service_name": "Pool or rockhole",
+        "geometry_type": "esriGeometryPoint",
+    },
+    22: {
+        "title": "Waterholes",
+        "service_name": "Waterhole",
+        "geometry_type": "esriGeometryPoint",
+    },
+    23: {
+        "title": "Waterfalls",
+        "service_name": "Waterfall",
+        "geometry_type": "esriGeometryPoint",
+    },
+    24: {
+        "title": "Coastline",
+        "service_name": "Coastline",
+        "geometry_type": "esriGeometryPolyline",
+    },
+    25: {
+        "title": "Flats or Swamps",
+        "service_name": "Flat or swamp",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    26: {
+        "title": "Pondage Areas",
+        "service_name": "Pondage area",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    27: {
+        "title": "Lakes",
+        "service_name": "Lake",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    28: {
+        "title": "Reservoirs",
+        "service_name": "Reservoir",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    30: {
+        "title": "Canal Lines",
+        "service_name": "Canal line",
+        "geometry_type": "esriGeometryPolyline",
+    },
+    31: {
+        "title": "Canal Areas",
+        "service_name": "Canal area",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    33: {
+        "title": "Watercourse Lines",
+        "service_name": "Watercourse lines",
+        "geometry_type": "esriGeometryPolyline",
+    },
+    34: {
+        "title": "Watercourse Areas",
+        "service_name": "Watercourse area",
+        "geometry_type": "esriGeometryPolygon",
+    },
+    35: {
+        "title": "Water Area Edges",
+        "service_name": "Water area edge",
+        "geometry_type": "esriGeometryPolyline",
+    },
+    37: {
+        "title": "Watercourse Stream Orders",
+        "service_name": "Watercourse stream order",
+        "geometry_type": "esriGeometryPolyline",
+    },
+}
+WATER_LAYER_IDS = tuple(WATER_LAYER_CONFIG.keys())
+WATER_LAYER_TITLES = {layer_id: meta["title"] for layer_id, meta in WATER_LAYER_CONFIG.items()}
+
 # ── HTTP / paging
 ARCGIS_TIMEOUT = 45          # seconds
 ARCGIS_MAX_RECORDS = 2000    # per page (server permits this on these layers)

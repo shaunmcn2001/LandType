@@ -95,6 +95,32 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
         lambda env: easement_fc,
     )
 
+    water_polygon = Polygon([(0.1, 0.1), (0.1, 0.9), (0.9, 0.9), (0.9, 0.1)])
+    water_fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": mapping(water_polygon),
+                "properties": {"code": "W-1", "name": "Test Water Feature"},
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        main,
+        "fetch_water_layers_intersecting_envelope",
+        lambda env: [
+            {
+                "layer_id": 25,
+                "layer_title": "Test Water Layer",
+                "source_layer_name": "Test Water Layer",
+                "geometry_type": "esriGeometryPolygon",
+                "feature_collection": water_fc,
+            }
+        ],
+    )
+
     client = TestClient(main.app)
     response = client.get("/export_kmz", params={"lotplan": "1TEST", "veg_url": ""})
 
@@ -127,4 +153,7 @@ def test_export_kmz_includes_bore_icons(monkeypatch):
         assert "Alias: -" in doc_text
         assert "Area: " in doc_text
         assert "Access Easement (Lot/Plan: 1TEST" in doc_text
-        assert "<Folder><name>Groundwater Bores</name>" in doc_text
+        assert "<Folder><name>Water</name>" in doc_text
+        assert "<Folder><name>Water</name><Folder><name>Groundwater Bores</name>" in doc_text
+        assert "<Folder><name>Test Water Layer</name>" in doc_text
+        assert "Test Water Feature" in doc_text

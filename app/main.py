@@ -28,6 +28,7 @@ from .arcgis import (
     fetch_features_intersecting_envelope,
     fetch_landtypes_intersecting_envelope,
     fetch_parcel_geojson,
+    fetch_water_layers_intersecting_envelope,
     normalize_lotplan,
 )
 from .colors import color_from_code
@@ -443,6 +444,198 @@ def _prepare_bore_placemarks(
     return placemarks, assets
 
 
+def _format_water_value(key: str, value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        key_lower = (key or "").lower()
+        if "date" in key_lower:
+            try:
+                ts = float(value)
+                if ts > 10_000_000_000:
+                    ts = ts / 1000.0
+                return dt.datetime.utcfromtimestamp(ts).date().isoformat()
+            except Exception:
+                pass
+        return str(value)
+    text = _clean_text(value)
+    return text
+
+
+def _format_water_description(props: Dict[str, Any]) -> str:
+    name = props.get("display_name") or props.get("name") or props.get("layer_title") or "Water feature"
+    lines: List[str] = [f"<b>{html.escape(str(name))}</b>"]
+    layer_title = props.get("layer_title")
+    if layer_title:
+        lines.append(f"<span class=\"muted\">Layer:</span> {html.escape(str(layer_title))}")
+    lotplan = props.get("lotplan")
+    if lotplan:
+        lines.append(f"<span class=\"muted\">Lot/Plan:</span> {html.escape(str(lotplan))}")
+
+    skip_keys = {
+        "display_name",
+        "name",
+        "code",
+        "layer_id",
+        "layer_title",
+        "source_layer_name",
+        "lotplan",
+        "icon_key",
+    }
+
+    extra: List[Tuple[str, str]] = []
+    for key, raw_value in (props or {}).items():
+        if key in skip_keys:
+            continue
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, (list, tuple)):
+            values = [_clean_text(v) for v in raw_value if _clean_text(v)]
+            if not values:
+                continue
+            value_text = ", ".join(values)
+        else:
+            value_text = _format_water_value(key, raw_value)
+            value_text = _clean_text(value_text)
+            if not value_text:
+                continue
+        label = key.replace("_", " ").strip().title()
+        extra.append((label, value_text))
+
+    extra.sort()
+    for label, value_text in extra[:8]:
+        lines.append(f"<span class=\"muted\">{html.escape(label)}:</span> {html.escape(value_text)}")
+
+    return "<br/>".join(lines)
+
+
+@dataclass(frozen=True)
+class WaterLayerKMZ:
+    layer_id: int
+    layer_title: str
+    source_layer_name: str
+    geometry_type: Optional[str]
+    shapes: Tuple[tuple, ...]
+    points: Tuple[PointPlacemark, ...]
+    feature_collection: Dict[str, Any]
+
+
+def _prepare_water_layers(
+    parcel_fc: Dict[str, Any],
+    water_layers_raw: Sequence[Dict[str, Any]],
+    lotplan: Optional[str],
+) -> List[WaterLayerKMZ]:
+    if not water_layers_raw:
+        return []
+
+    prepared: List[WaterLayerKMZ] = []
+
+    for layer in water_layers_raw:
+        layer_id = int(layer.get("layer_id", -1))
+        layer_title = layer.get("layer_title") or f"Layer {layer_id}"
+        source_layer_name = layer.get("source_layer_name") or layer_title
+        feature_collection = layer.get("feature_collection") or {}
+        features = list(feature_collection.get("features", []))
+        if not features:
+            continue
+
+        props_lookup: Dict[str, Dict[str, Any]] = {}
+        features_for_clip: List[Dict[str, Any]] = []
+        fc_for_clip = {"type": "FeatureCollection", "features": features_for_clip}
+        for feature in features:
+            geometry = feature.get("geometry")
+            if not geometry:
+                continue
+            props = dict(feature.get("properties") or {})
+            code = _clean_text(props.get("code"))
+            if not code:
+                continue
+            display_name = props.get("name") or layer_title
+            props["name"] = display_name
+            props.setdefault("display_name", display_name)
+            props.setdefault("layer_id", layer_id)
+            props.setdefault("layer_title", layer_title)
+            props.setdefault("source_layer_name", source_layer_name)
+            if lotplan:
+                props.setdefault("lotplan", lotplan)
+            props_lookup[code] = props
+            features_for_clip.append(
+                {"type": "Feature", "geometry": geometry, "properties": props}
+            )
+
+        if not props_lookup:
+            continue
+
+        clipped = prepare_clipped_shapes(parcel_fc, fc_for_clip)
+        if not clipped:
+            continue
+
+        shapes: List[tuple] = []
+        points: List[PointPlacemark] = []
+        clipped_features: List[Dict[str, Any]] = []
+
+        for geom4326, code, name, area_ha in clipped:
+            props = dict(props_lookup.get(code, {}))
+            props.setdefault("name", name)
+            if lotplan:
+                props.setdefault("lotplan", lotplan)
+            try:
+                geom_mapping = shp_mapping(geom4326)
+            except Exception:
+                continue
+            clipped_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": geom_mapping,
+                    "properties": props,
+                }
+            )
+
+            geom_type = getattr(geom4326, "geom_type", "")
+            if geom_type == "Point":
+                description_html = _format_water_description(props)
+                points.append(
+                    PointPlacemark(
+                        name=props.get("display_name") or props.get("name") or code,
+                        description_html=description_html,
+                        lon=float(geom4326.x),
+                        lat=float(geom4326.y),
+                    )
+                )
+            elif geom_type == "MultiPoint":
+                description_html = _format_water_description(props)
+                for part in getattr(geom4326, "geoms", []):
+                    if part is None or getattr(part, "is_empty", False):
+                        continue
+                    points.append(
+                        PointPlacemark(
+                            name=props.get("display_name") or props.get("name") or code,
+                            description_html=description_html,
+                            lon=float(part.x),
+                            lat=float(part.y),
+                        )
+                    )
+            else:
+                shapes.append((geom4326, code, props.get("name") or name, area_ha))
+
+        prepared.append(
+            WaterLayerKMZ(
+                layer_id=layer_id,
+                layer_title=layer_title,
+                source_layer_name=source_layer_name,
+                geometry_type=layer.get("geometry_type"),
+                shapes=tuple(shapes),
+                points=tuple(points),
+                feature_collection={
+                    "type": "FeatureCollection",
+                    "features": clipped_features,
+                },
+            )
+        )
+
+    return prepared
+
+
 def _render_parcel_kml(
     lotplan: str,
     lt_clipped,
@@ -451,7 +644,7 @@ def _render_parcel_kml(
 ) -> str:
     folder_name = f"QLD Land Types – {lotplan}"
     if veg_clipped:
-        groups = [
+        groups: List[Any] = [
             (lt_clipped, color_from_code, f"Land Types – {lotplan}"),
             (veg_clipped, color_from_code, f"Vegetation – {lotplan}"),
         ]
@@ -491,6 +684,7 @@ class PropertyReportKMZ:
     vegetation: Tuple[tuple, ...]
     easements: Tuple[tuple, ...]
     easement_color_map: Mapping[str, str]
+    water_layers: Tuple[WaterLayerKMZ, ...]
     bore_points: Tuple[PointPlacemark, ...]
     bore_assets: Mapping[str, bytes]
 
@@ -525,6 +719,9 @@ def build_property_report_kmz(
 
     bore_fc = fetch_bores_intersecting_envelope(env)
     bore_points, bore_assets = _prepare_bore_placemarks(parcel_union, bore_fc)
+
+    water_layers_raw = fetch_water_layers_intersecting_envelope(env)
+    water_layers = _prepare_water_layers(parcel_fc, water_layers_raw, lotplan_norm)
 
     veg_url = (veg_service_url or "").strip()
     veg_layer = veg_layer_id
@@ -654,20 +851,37 @@ def build_property_report_kmz(
         base = easement_color_lookup.get(code, code)
         return color_from_code(base)
 
-    groups = []
+    top_level_groups: List[Tuple[str, List[tuple]]] = []
     if lt_clipped:
-        groups.append((lt_clipped, color_from_code, "Land Types"))
+        top_level_groups.append(("Land Types", [(lt_clipped, color_from_code, None)]))
     if veg_clipped:
-        groups.append((veg_clipped, color_from_code, "Vegetation"))
+        top_level_groups.append(("Vegetation", [(veg_clipped, color_from_code, None)]))
     if easement_clipped:
-        groups.append((easement_clipped, _easement_color_fn, "Easements"))
+        top_level_groups.append(("Easements", [(easement_clipped, _easement_color_fn, None)]))
+
+    water_children: List[tuple] = []
     if bore_points:
-        groups.append(([], color_from_code, BORE_FOLDER_NAME, list(bore_points)))
+        water_children.append(([], color_from_code, BORE_FOLDER_NAME, list(bore_points)))
+    for layer in water_layers:
+        def _water_color_fn(code: str, _layer_id=layer.layer_id) -> Tuple[int, int, int]:
+            return color_from_code(f"WATER-{_layer_id}")
+
+        water_children.append(
+            (list(layer.shapes), _water_color_fn, layer.layer_title, list(layer.points))
+        )
+
+    if water_children:
+        top_level_groups.append(("Water", water_children))
 
     doc_name = f"Property Report – {lotplan_norm}"
-    kml_text = build_kml_folders(groups, doc_name=doc_name)
+    kml_text = build_kml_nested_folders(top_level_groups, doc_name=doc_name)
 
-    if not (lt_clipped or veg_clipped or easement_clipped or bore_points):
+    has_water = any(
+        (layer.shapes or layer.points or layer.feature_collection.get("features"))
+        for layer in water_layers
+    )
+
+    if not (lt_clipped or veg_clipped or easement_clipped or bore_points or has_water):
         raise HTTPException(status_code=404, detail="No features intersect this parcel.")
 
     tmpdir = tempfile.mkdtemp(prefix="kmz_")
@@ -697,6 +911,7 @@ def build_property_report_kmz(
         vegetation=tuple(veg_clipped or []),
         easements=tuple(easement_clipped or []),
         easement_color_map=dict(easement_color_lookup),
+        water_layers=tuple(water_layers),
         bore_points=tuple(bore_points),
         bore_assets=dict(bore_assets),
     )
@@ -780,6 +995,23 @@ const BORE_STATUS_COLORS = {
   AD: '#ef4444',
   IN: '#f59e0b'
 };
+const WATER_LAYER_COLORS = {
+  20: '#0ea5e9',
+  21: '#38bdf8',
+  22: '#3b82f6',
+  23: '#1d4ed8',
+  24: '#0ea5e9',
+  25: '#22d3ee',
+  26: '#0891b2',
+  27: '#2563eb',
+  28: '#1e40af',
+  30: '#0ea5e9',
+  31: '#0284c7',
+  33: '#14b8a6',
+  34: '#0f766e',
+  35: '#0d9488',
+  37: '#06b6d4'
+};
 const ESCAPE_HTML_LOOKUP = {
   "&": "&amp;",
   "<": "&lt;",
@@ -793,6 +1025,11 @@ function colorForBoreStatus(status){
   return BORE_STATUS_COLORS[key] || DEFAULT_BORE_COLOR;
 }
 
+function colorForWaterLayer(id){
+  const key = Number(id);
+  return WATER_LAYER_COLORS[key] || '#22d3ee';
+}
+
 function boreClassName(key){
   if (!key) return 'bore-marker';
   return `bore-marker bore-${String(key).toLowerCase().replace(/[^a-z0-9]+/g,'-')}`;
@@ -800,6 +1037,44 @@ function boreClassName(key){
 
 function escHtml(value){
   return (value == null ? '' : String(value)).replace(/[&<>"']/g, ch => ESCAPE_HTML_LOOKUP[ch] || ch);
+}
+
+function formatWaterPopup(props){
+  const data = props || {};
+  const lines = [];
+  const name = data.display_name || data.name || data.layer_title || 'Water feature';
+  lines.push(`<strong>${escHtml(name)}</strong>`);
+  if (data.layer_title){ lines.push(`<span class="muted">Layer:</span> ${escHtml(data.layer_title)}`); }
+  if (data.lotplan){ lines.push(`<span class="muted">Lot/Plan:</span> ${escHtml(data.lotplan)}`); }
+
+  const skip = new Set(['display_name','name','layer_title','layer_id','source_layer_name','lotplan','code']);
+  const entries = [];
+  for (const [key, raw] of Object.entries(data)){
+    if (skip.has(key) || raw == null || raw === '') continue;
+    let text = '';
+    if (Array.isArray(raw)){
+      const vals = raw.map(v => escHtml(v)).filter(Boolean);
+      if (!vals.length) continue;
+      text = vals.join(', ');
+    } else {
+      if (typeof raw === 'number' && key.toLowerCase().includes('date')){
+        const stamp = raw > 1e12 ? raw : raw * 1000;
+        const dt = new Date(stamp);
+        if (!Number.isNaN(dt.getTime())){
+          text = dt.toISOString().slice(0, 10);
+        }
+      }
+      if (!text){ text = escHtml(String(raw)); }
+      if (!text) continue;
+    }
+    const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    entries.push([label, text]);
+  }
+  entries.sort((a,b)=>a[0].localeCompare(b[0]));
+  for (const [label, text] of entries.slice(0,6)){
+    lines.push(`<span class="muted">${escHtml(label)}:</span> ${text}`);
+  }
+  return lines.join('<br/>');
 }
 
 function normText(s){ return (s || '').trim(); }
@@ -837,7 +1112,7 @@ function updateMode(){
   }
 }
 
-let map=null, parcelLayer=null, ltLayer=null, boreLayer=null, easementLayer=null;
+let map=null, parcelLayer=null, ltLayer=null, boreLayer=null, easementLayer=null, waterLayers=[];
 function ensureMap(){
   try{
     if (map) return;
@@ -854,6 +1129,7 @@ function clearLayers(){
     if(map && ltLayer){ map.removeLayer(ltLayer); ltLayer=null; }
     if(map && boreLayer){ map.removeLayer(boreLayer); boreLayer=null; }
     if(map && easementLayer){ map.removeLayer(easementLayer); easementLayer=null; }
+    if(map && waterLayers.length){ waterLayers.forEach(layer => map.removeLayer(layer)); waterLayers=[]; }
   }catch{}
 }
 function mkVectorUrl(lotplan){ return `/vector?lotplan=${encodeURIComponent(lotplan)}`; }
@@ -952,6 +1228,35 @@ async function loadVector(){
           layer.bindPopup(lines.join('<br/>'));
         }
       }).addTo(map);
+    }
+    const waterData = data.water && Array.isArray(data.water.layers) ? data.water.layers : [];
+    for (const entry of waterData){
+      if (!entry || !entry.features || !Array.isArray(entry.features.features) || !entry.features.features.length) continue;
+      const color = colorForWaterLayer(entry.layer_id);
+      const geo = L.geoJSON(entry.features, {
+        style: feature => {
+          const geomType = feature && feature.geometry ? feature.geometry.type : null;
+          if (geomType === 'LineString' || geomType === 'MultiLineString'){
+            return { color, weight: 2.5, opacity: 0.9 };
+          }
+          if (geomType === 'Polygon' || geomType === 'MultiPolygon'){
+            return { color: '#0c1325', weight: 1.2, fillColor: color, fillOpacity: 0.35 };
+          }
+          return { color };
+        },
+        pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+          radius: 5,
+          color,
+          weight: 1.4,
+          fillColor: color,
+          fillOpacity: 0.85
+        }),
+        onEachFeature: (feature, layer) => {
+          const html = formatWaterPopup(feature && feature.properties);
+          if (html){ layer.bindPopup(html); }
+        }
+      }).addTo(map);
+      waterLayers.push(geo);
     }
     const b = data.bounds4326;
     if (b){
@@ -1059,7 +1364,7 @@ def export_geotiff(lotplan: str = Query(...), max_px: int = Query(4096, ge=256, 
         )
     else:
         public = {k:v for k,v in result.items() if k != "path"}
-        legend = {}
+        legend: Dict[str, Dict[str, Any]] = {}
         for _g, code, name, area_ha in clipped:
             c = _hex(color_from_code(code))
             legend.setdefault(code, {"code":code,"name":name,"color_hex":c,"area_ha":0.0})
@@ -1078,6 +1383,8 @@ def vector_geojson(lotplan: str = Query(...)):
     clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
     bore_fc = fetch_bores_intersecting_envelope(env)
     easement_fc = fetch_easements_intersecting_envelope(env)
+    water_layers_raw = fetch_water_layers_intersecting_envelope(env)
+    water_layers = _prepare_water_layers(parcel_fc, water_layers_raw, lotplan)
 
     for feature in parcel_fc.get("features", []):
         props = feature.get("properties") or {}
@@ -1155,20 +1462,42 @@ def vector_geojson(lotplan: str = Query(...)):
             }
         )
 
-    bounds_fc = {"type": "FeatureCollection", "features": []}
-    bounds_fc["features"].extend(parcel_fc.get("features", []))
-    bounds_fc["features"].extend(features)
-    bounds_fc["features"].extend(bore_features)
-    bounds_fc["features"].extend(easement_features)
+    water_layers_payload: List[Dict[str, Any]] = []
+    total_water_features = 0
+    for layer in water_layers:
+        fc = layer.feature_collection
+        features_list = list(fc.get("features", []))
+        total_water_features += len(features_list)
+        water_layers_payload.append(
+            {
+                "layer_id": layer.layer_id,
+                "layer_title": layer.layer_title,
+                "source_layer_name": layer.source_layer_name,
+                "features": {"type": "FeatureCollection", "features": features_list},
+            }
+        )
+
+    bounds_features: List[Dict[str, Any]] = []
+    bounds_features.extend(parcel_fc.get("features", []))
+    bounds_features.extend(features)
+    bounds_features.extend(bore_features)
+    bounds_features.extend(easement_features)
+    for layer_entry in water_layers_payload:
+        layer_features = layer_entry.get("features", {}).get("features", [])
+        bounds_features.extend(layer_features)
+
+    bounds_fc = {"type": "FeatureCollection", "features": bounds_features}
     bounds_geom = to_shapely_union(bounds_fc)
     bounds_dict = _bounds_dict_from_geom(bounds_geom, parcel_union)
-    status_code = 200 if features else 404
+    has_data = bool(features or bore_features or easement_features or total_water_features)
+    status_code = 200 if has_data else 404
     payload = {
         "lotplan": lotplan,
         "parcel": parcel_fc,
         "landtypes": {"type": "FeatureCollection", "features": features},
         "bores": {"type": "FeatureCollection", "features": bore_features},
         "easements": {"type": "FeatureCollection", "features": easement_features},
+        "water": {"layers": water_layers_payload},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": bounds_dict,
     }
@@ -1205,6 +1534,7 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
     legend_map: Dict[str, Dict[str, Any]] = {}
     bounds = None
     seen_bore_numbers: Set[str] = set()
+    water_layers_map: Dict[int, Dict[str, Any]] = {}
 
     def expand_bounds(current, geom):
         if geom.is_empty:
@@ -1243,6 +1573,8 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
         clipped = prepare_clipped_shapes(parcel_fc, lt_fc)
         bore_fc = fetch_bores_intersecting_envelope(env)
         easement_fc = fetch_easements_intersecting_envelope(env)
+        water_layers_raw = fetch_water_layers_intersecting_envelope(env)
+        water_layers = _prepare_water_layers(parcel_fc, water_layers_raw, lotplan)
 
         for bore in bore_fc.get("features", []):
             try:
@@ -1286,6 +1618,30 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
             )
             bounds = expand_bounds(bounds, clipped_geom)
 
+        for layer in water_layers:
+            fc = layer.feature_collection
+            features_list = list(fc.get("features", []))
+            if not features_list:
+                continue
+            entry = water_layers_map.setdefault(
+                layer.layer_id,
+                {
+                    "layer_id": layer.layer_id,
+                    "layer_title": layer.layer_title,
+                    "source_layer_name": layer.source_layer_name,
+                    "features": [],
+                },
+            )
+            entry["features"].extend(features_list)
+            for feature in features_list:
+                try:
+                    geom = shp_shape(feature.get("geometry"))
+                except Exception:
+                    continue
+                if geom.is_empty:
+                    continue
+                bounds = expand_bounds(bounds, geom)
+
         for geom4326, code, name, area_ha in clipped:
             if geom4326.is_empty:
                 continue
@@ -1310,7 +1666,13 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
             })
             legend_map[code]["area_ha"] += float(area_ha)
 
-    if not parcel_features and not landtype_features and not bore_features and not easement_features:
+    if (
+        not parcel_features
+        and not landtype_features
+        and not bore_features
+        and not easement_features
+        and not any(entry.get("features") for entry in water_layers_map.values())
+    ):
         raise HTTPException(status_code=404, detail="No features found for the provided lots/plans.")
 
     bounds_dict = None
@@ -1318,12 +1680,24 @@ def vector_geojson_bulk(payload: VectorBulkRequest):
         west, south, east, north = bounds
         bounds_dict = {"west": west, "south": south, "east": east, "north": north}
 
+    water_layers_payload = []
+    for layer_id, entry in sorted(water_layers_map.items()):
+        water_layers_payload.append(
+            {
+                "layer_id": entry["layer_id"],
+                "layer_title": entry["layer_title"],
+                "source_layer_name": entry["source_layer_name"],
+                "features": {"type": "FeatureCollection", "features": list(entry.get("features", []))},
+            }
+        )
+
     return JSONResponse({
         "lotplans": lotplans,
         "parcels": {"type": "FeatureCollection", "features": parcel_features},
         "landtypes": {"type": "FeatureCollection", "features": landtype_features},
         "bores": {"type": "FeatureCollection", "features": bore_features},
         "easements": {"type": "FeatureCollection", "features": easement_features},
+        "water": {"layers": water_layers_payload},
         "legend": sorted(legend_map.values(), key=lambda d: (-d["area_ha"], d["code"])),
         "bounds4326": bounds_dict,
     })
@@ -1457,11 +1831,11 @@ def _create_bulk_kmz(
             veg_code_field=veg_code_field,
         )
 
-        subgroups: List[Tuple[Iterable, Any, str]] = []
+        subgroups: List[tuple] = []
         if report.landtypes:
-            subgroups.append((report.landtypes, color_from_code, "Land Types"))
+            subgroups.append((list(report.landtypes), color_from_code, "Land Types"))
         if report.vegetation:
-            subgroups.append((report.vegetation, color_from_code, "Vegetation"))
+            subgroups.append((list(report.vegetation), color_from_code, "Vegetation"))
         if report.easements:
             mapping = dict(report.easement_color_map)
 
@@ -1469,9 +1843,21 @@ def _create_bulk_kmz(
                 base = _mapping.get(code, code)
                 return color_from_code(base)
 
-            subgroups.append((report.easements, _color_fn, "Easements"))
+            subgroups.append((list(report.easements), _color_fn, "Easements"))
+
+        water_children: List[tuple] = []
         if report.bore_points:
-            subgroups.append(([], color_from_code, BORE_FOLDER_NAME, list(report.bore_points)))
+            water_children.append(([], color_from_code, BORE_FOLDER_NAME, list(report.bore_points)))
+        for layer in report.water_layers:
+            def _water_color_fn(code: str, _layer_id=layer.layer_id) -> Tuple[int, int, int]:
+                return color_from_code(f"WATER-{_layer_id}")
+
+            water_children.append(
+                (list(layer.shapes), _water_color_fn, layer.layer_title, list(layer.points))
+            )
+
+        if water_children:
+            subgroups.append(([], color_from_code, "Water", [], water_children))
 
         nested_groups.append((report.lotplan, subgroups))
 

@@ -1,7 +1,7 @@
 # app/geometry.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, cast
 
 from pyproj import Transformer
 from shapely.geometry import GeometryCollection, shape
@@ -11,7 +11,7 @@ from shapely.validation import make_valid
 
 
 def to_shapely_union(fc: Dict[str, Any]):
-    geoms = []
+    geoms: List[Any] = []
     for f in (fc or {}).get("features", []):
         try:
             g = shape(f.get("geometry"))
@@ -54,7 +54,7 @@ def _area_ha(geom4326) -> float:
 def prepare_clipped_shapes(parcel_fc: Dict[str, Any], thematic_fc: Dict[str, Any]) -> List[tuple]:
     parcel_u = to_shapely_union(parcel_fc)
     if parcel_u.is_empty: return []
-    out = []
+    out: List[tuple] = []
     for f in (thematic_fc or {}).get("features", []):
         props = f.get("properties") or {}
         code = str(props.get("code") or props.get("CODE") or props.get("MAP_CODE") or props.get("CLASS_CODE") or props.get("lt_code_1") or "UNK")
@@ -74,15 +74,23 @@ def prepare_clipped_shapes(parcel_fc: Dict[str, Any], thematic_fc: Dict[str, Any
         if inter.is_empty: continue
         out.append((inter, code, name, float(_area_ha(inter))))
     # dissolve by code+name
-    by_key = {}
+    aggregated: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for g, c, n, a in out:
         key = (c, n)
-        if key not in by_key:
-            by_key[key] = [g, a]
+        entry = aggregated.setdefault(key, {"geom": None, "area": 0.0})
+        geom_existing = entry.get("geom")
+        if geom_existing is None:
+            entry["geom"] = g
         else:
-            by_key[key][0] = by_key[key][0].union(g)
-            by_key[key][1] += a
-    final = [(geom, c, n, by_key[(c,n)][1]) for (c, n), (geom, _) in by_key.items() if not geom.is_empty]
+            entry["geom"] = geom_existing.union(g)
+        entry["area"] = float(entry.get("area", 0.0)) + float(a)
+
+    final = []
+    for (code, name), entry in aggregated.items():
+        geom_obj = entry.get("geom")
+        if geom_obj is None or getattr(geom_obj, "is_empty", False):
+            continue
+        final.append((geom_obj, code, name, float(entry.get("area", 0.0))))
     return final
 
 def merge_clipped_shapes_across_lots(all_clipped_data: List[List[tuple]]) -> List[tuple]:
@@ -91,20 +99,20 @@ def merge_clipped_shapes_across_lots(all_clipped_data: List[List[tuple]]) -> Lis
         return []
     
     # Collect all shapes by (code, name) key
-    by_key = {}
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for clipped_data in all_clipped_data:
         for geom, code, name, area_ha in clipped_data:
             key = (code, name)
-            if key not in by_key:
-                by_key[key] = {"geoms": [], "total_area": 0.0}
-            by_key[key]["geoms"].append(geom)
-            by_key[key]["total_area"] += area_ha
+            entry = by_key.setdefault(key, {"geoms": [], "total_area": 0.0})
+            geoms_list = cast(List[Any], entry.setdefault("geoms", []))
+            geoms_list.append(geom)
+            entry["total_area"] = float(entry.get("total_area", 0.0)) + float(area_ha)
     
     # Merge geometries for each key
-    merged = []
+    merged: List[tuple] = []
     for (code, name), data in by_key.items():
-        geoms = data["geoms"]
-        total_area = data["total_area"]
+        geoms = cast(List[Any], data.get("geoms", []))
+        total_area = float(data.get("total_area", 0.0))
         
         if not geoms:
             continue

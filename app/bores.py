@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, cast
 
 from .config import BORE_ICON_MAP, BORE_LAYER_ID, BORE_SERVICE_URL
 
@@ -93,11 +93,13 @@ _ICON_BY_KEY: Dict[str, BoreIconDefinition] = {}
 for (status, bore_type), meta in BORE_ICON_MAP.items():
     status_norm = _clean_code(status)
     type_norm = _clean_code(bore_type)
+    meta_mapping = cast(Mapping[str, Any], meta)
+    symbol_meta = cast(Mapping[str, Any], meta_mapping.get("symbol") or {})
     definition = BoreIconDefinition(
         status_code=status_norm,
         bore_type_code=type_norm,
-        label=str(meta.get("label", "")),
-        symbol=dict(meta.get("symbol") or {}),
+        label=str(meta_mapping.get("label", "")),
+        symbol=dict(symbol_meta),
     )
     pair_key = (status_norm, type_norm)
     _ICON_BY_PAIR[pair_key] = definition

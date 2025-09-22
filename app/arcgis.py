@@ -35,6 +35,10 @@ from .config import (
     PARCEL_LOTPLAN_FIELD,
     PARCEL_PLAN_FIELD,
     PARCEL_SERVICE_URL,
+    WATER_LAYER_CONFIG,
+    WATER_LAYER_IDS,
+    WATER_LAYER_TITLES,
+    WATER_SERVICE_URL,
 )
 from .bores import (
     get_bore_icon,
@@ -62,10 +66,10 @@ def _merge_fc(accum: Dict[str, Any], more: Dict[str, Any]) -> Dict[str, Any]:
 
 def _arcgis_geojson_query(service_url: str, layer_id: int, params: Dict[str, Any], paginate: bool = True) -> Dict[str, Any]:
     url = _layer_query_url(service_url, layer_id)
-    base = {"f": "geojson", "returnGeometry": "true"}
+    base: Dict[str, Any] = {"f": "geojson", "returnGeometry": "true"}
     base.update(params or {})
-    result_offset = int(base.pop("resultOffset", 0))
-    result_record_count = int(base.pop("resultRecordCount", ARCGIS_MAX_RECORDS))
+    result_offset: int = int(base.pop("resultOffset", 0))
+    result_record_count: int = int(base.pop("resultRecordCount", ARCGIS_MAX_RECORDS))
 
     sess = requests.Session()
     out_fc: Dict[str, Any] = {}
@@ -280,3 +284,111 @@ def fetch_bores_intersecting_envelope(env_3857) -> Dict[str, Any]:
         )
 
     return {"type": "FeatureCollection", "features": features_out}
+
+
+def _water_feature_code(layer_id: int, props: Dict[str, Any], index: int) -> str:
+    primary = (
+        props.get("code")
+        or props.get("pfi")
+        or props.get("ufi")
+        or props.get("watercourse_id")
+        or props.get("water_id")
+        or props.get("objectid")
+        or props.get("OBJECTID")
+        or props.get("fid")
+        or props.get("FID")
+        or props.get("id")
+    )
+    code = _clean_text(primary)
+    if not code:
+        code = str(index)
+    return f"W{layer_id}-{code}"
+
+
+def fetch_water_layers_intersecting_envelope(env_3857):
+    """Fetch configured surface-water layers intersecting the parcel envelope."""
+
+    if not WATER_SERVICE_URL or not WATER_LAYER_IDS:
+        return []
+
+    results = []
+    for layer_id in WATER_LAYER_IDS:
+        meta = WATER_LAYER_CONFIG.get(layer_id, {})
+        try:
+            fc = fetch_features_intersecting_envelope(
+                WATER_SERVICE_URL,
+                layer_id,
+                env_3857,
+                out_sr=4326,
+                out_fields="*",
+            )
+        except Exception:
+            continue
+
+        features_out: List[Dict[str, Any]] = []
+        for idx, feature in enumerate(fc.get("features", []), start=1):
+            geometry = feature.get("geometry")
+            if not geometry:
+                continue
+            props_raw = feature.get("properties") or {}
+            props = dict(props_raw)
+
+            code = _water_feature_code(layer_id, props, idx)
+            name = _clean_text(
+                props.get("name")
+                or props.get("feature_name")
+                or props.get("watercourse_name")
+                or props.get("feature_type")
+                or props.get("type")
+                or props.get("perenniality")
+            )
+
+            layer_title = meta.get("title") or WATER_LAYER_TITLES.get(layer_id) or f"Layer {layer_id}"
+            if not name:
+                name = layer_title
+
+            reference_id = _clean_text(
+                props.get("pfi")
+                or props.get("ufi")
+                or props.get("watercourse_id")
+                or props.get("water_id")
+                or props.get("objectid")
+                or props.get("OBJECTID")
+                or props.get("fid")
+                or props.get("FID")
+            )
+
+            props.update(
+                {
+                    "code": code,
+                    "name": name,
+                    "layer_id": layer_id,
+                    "layer_title": layer_title,
+                    "source_layer_name": meta.get("service_name") or layer_title,
+                }
+            )
+            if reference_id and reference_id != code:
+                props.setdefault("reference_id", reference_id)
+
+            features_out.append(
+                {
+                    "type": "Feature",
+                    "geometry": geometry,
+                    "properties": props,
+                }
+            )
+
+        if not features_out:
+            continue
+
+        results.append(
+            {
+                "layer_id": layer_id,
+                "layer_title": meta.get("title") or WATER_LAYER_TITLES.get(layer_id) or f"Layer {layer_id}",
+                "source_layer_name": meta.get("service_name") or WATER_LAYER_TITLES.get(layer_id) or f"Layer {layer_id}",
+                "geometry_type": meta.get("geometry_type"),
+                "feature_collection": {"type": "FeatureCollection", "features": features_out},
+            }
+        )
+
+    return results
